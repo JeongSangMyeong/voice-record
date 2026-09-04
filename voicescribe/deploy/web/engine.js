@@ -173,9 +173,9 @@ async function pickDtype(model, device) {
   return profiles[await pickProfileKey(device)].dtype;
 }
 
-async function getTranscriber(model, onEvent) {
+async function getTranscriber(model, onEvent, forceDevice = null) {
   await loadLibrary();
-  const device = await pickDevice();
+  const device = forceDevice || (await pickDevice());
   const key = `${model}|${device}`;
   if (transcriber && loadedKey === key) return { asr: transcriber, device };
 
@@ -206,6 +206,18 @@ async function getTranscriber(model, onEvent) {
   }
   loadedKey = key;
   return { asr: transcriber, device };
+}
+
+/**
+ * 그래픽 가속 장치가 빠졌는지 본다.
+ *
+ * 휴대폰을 다른 앱에 오래 두면 안드로이드가 그래픽 메모리를 회수해 간다.
+ * 그러면 돌던 작업이 여기서 터진다. 처음부터 다시 시키지 말고
+ * 일반 모드로 갈아타서 이어서 하는 편이 낫다.
+ */
+function isDeviceLost(error) {
+  const text = String(error?.message || error || "").toLowerCase();
+  return /device.*(lost|destroyed)|gpu|webgpu|context.*lost|adapter/.test(text);
 }
 
 /** Whisper 가 한 번에 볼 수 있는 최대 길이(초). 이보다 길게 넣으면 잘린다. */
@@ -341,14 +353,38 @@ export async function runTranscription(request, onEvent) {
 
   const collected = [];
   let text = "";
+  let engine = asr;
+  let usingDevice = device;
+  let switchedToCpu = false;
+
+  const options = {
+    language: language === "auto" ? null : language,
+    task: "transcribe",
+    return_timestamps: true,
+    chunk_length_s: 0,   // 창이 이미 30초 이하라 추가로 자를 필요가 없다
+  };
+
   for (let i = 0; i < windows.length; i++) {
     const w = windows[i];
-    const piece = await asr(audio.subarray(w.from, w.to), {
-      language: language === "auto" ? null : language,
-      task: "transcribe",
-      return_timestamps: true,
-      chunk_length_s: 0,   // 창이 이미 30초 이하라 추가로 자를 필요가 없다
-    });
+    let piece;
+    try {
+      piece = await engine(audio.subarray(w.from, w.to), options);
+    } catch (error) {
+      // 다른 앱을 오래 쓰면 안드로이드가 그래픽 메모리를 회수해 간다.
+      // 그때 처음부터 다시 시키지 말고 일반 모드로 갈아타서 이어서 한다.
+      if (!switchedToCpu && usingDevice === "webgpu" && isDeviceLost(error)) {
+        switchedToCpu = true;
+        onEvent({ type: "phase", phase: "gpu-lost" });
+        transcriber = null;
+        loadedKey = null;
+        const again = await getTranscriber(model, onEvent, "wasm");
+        engine = again.asr;
+        usingDevice = again.device;
+        piece = await engine(audio.subarray(w.from, w.to), options);
+      } else {
+        throw error;
+      }
+    }
     text += (text ? " " : "") + (piece.text || "").trim();
     for (const c of piece.chunks || []) {
       collected.push({
@@ -384,7 +420,7 @@ export async function runTranscription(request, onEvent) {
       const { assignSpeakers } = await import("./diarize.js");
       const labels = await assignSpeakers(audio, chunks, sampleRate, {
         transformers: libRef,
-        device,
+        device: usingDevice,
         // 목소리 모델(약 26MB)도 처음 한 번은 내려받는다. 같은 진행률 막대를 쓴다.
         onProgress: (item) => {
           if (item.status === "progress" && item.total) {
@@ -411,6 +447,6 @@ export async function runTranscription(request, onEvent) {
     speakers,
     elapsed,
     duration: audio.length / sampleRate,
-    device,
+    device: usingDevice,   // 중간에 일반 모드로 갈아탔을 수 있다
   };
 }

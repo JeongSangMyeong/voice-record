@@ -176,7 +176,7 @@ let cancelled = false;
 let workerFailed = false;      // 작업자가 한 번 실패하면 이후에는 바로 우회한다
 let mainThreadBusy = false;
 // 파일을 고칠 때마다 올린다. 브라우저가 예전 파일을 쓰지 않게 하는 용도.
-const APP_VERSION = "20";
+const APP_VERSION = "21";
 
 /* ---------- 보안 연결 확인 (마이크는 https 에서만 된다) ---------- */
 if (!window.isSecureContext) {
@@ -466,13 +466,16 @@ async function askNotifyPermission() {
 }
 
 /** 서비스 워커를 통해 알림을 띄운다. 안드로이드 크롬은 이 방법만 허용한다. */
-async function showNotice(title, body) {
+async function showNotice(title, body, quiet = false) {
   if (!canNotify() || Notification.permission !== "granted") return;
   const options = {
     body,
     // 같은 표를 달아 두면 알림이 쌓이지 않고 하나가 갱신된다.
+    // (실측: 같은 표로 40번 띄워도 알림함에는 1개만 남고 내용만 바뀐다)
     tag: "voice-record",
-    renotify: true,
+    // 진행 중에는 소리·진동 없이 내용만 바꾸고, 끝나거나 실패했을 때만 알린다.
+    renotify: !quiet,
+    silent: quiet,
     icon: "icon-192.png",
   };
   try {
@@ -491,6 +494,22 @@ async function showNotice(title, body) {
   } catch {
     // 알림은 덤이다. 실패해도 받아쓰기에는 지장이 없다.
   }
+}
+
+/**
+ * 다른 앱을 보고 있는 동안 진행 상황을 알림 한 줄로 갱신해 준다.
+ *
+ * 완료 알림과 같은 표를 쓰므로 알림이 쌓이지 않고 한 줄이 계속 바뀐다.
+ * 새 타이머를 만들지 않고 작업자가 보내오는 진행 소식에 얹는다.
+ * (배경 탭에서는 타이머가 분당 1회로 떨어져 쓸 수 없다)
+ */
+let lastProgressNotice = 0;
+function showProgressNotice(body) {
+  if (!wantsNotice()) return;
+  if (!document.hidden) return;                          // 보고 있으면 군더더기다
+  if (Date.now() - lastProgressNotice < 15000) return;   // 15초에 한 번까지
+  lastProgressNotice = Date.now();
+  showNotice("받아쓰는 중", body, true);                  // 조용히 갱신만
 }
 
 function wantsNotice() {
@@ -682,12 +701,14 @@ function onWorker(event) {
       ? ` · 약 ${fmtTime(d.remaining)} 남음`
       : "";
     $("statusText").textContent = `받아쓰는 중… ${d.done}/${d.total} 구간${left}`;
+    showProgressNotice(`${Math.round(ratio * 100)}%  ${d.done}/${d.total} 구간${left}`);
     armStallNotice();
   } else if (d.type === "download-done") {
     downloaded.set(d.file, 1);
   } else if (d.type === "diarize-progress") {
     $("fill").style.width = `${90 + (d.done / Math.max(1, d.total)) * 8}%`;
     $("statusText").textContent = `화자를 구분하는 중… ${d.done}/${d.total}`;
+    showProgressNotice(`화자 구분 중 ${d.done}/${d.total}`);
   } else if (d.type === "phase") {
     currentPhase = d.phase;
     if (d.phase === "loading") {
@@ -703,6 +724,9 @@ function onWorker(event) {
     } else if (d.phase === "diarizing") {
       $("fill").style.width = "90%";
       $("statusText").textContent = "화자를 구분하는 중…";
+    } else if (d.phase === "gpu-lost") {
+      // 배경에 오래 있으면 안드로이드가 그래픽 메모리를 회수해 간다.
+      $("statusText").textContent = "그래픽 가속이 끊겨 일반 모드로 이어서 합니다…";
     } else if (d.phase === "retrying") {
       $("statusText").textContent = "다른 방식으로 다시 시도합니다…";
     } else if (d.phase === "diarize-skipped") {
