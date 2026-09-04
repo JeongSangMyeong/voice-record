@@ -142,6 +142,23 @@ class TestBrowserOnlyWebApp:
     업로드 코드가 실수로 들어오면 그 약속이 깨지므로 검사한다.
     """
 
+    def test_keeps_the_screen_awake_while_working(self):
+        """휴대폰은 화면이 꺼지면 다운로드를 멈춘다. 560MB 를 받는 중이면 치명적이다."""
+        html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+        assert "wakeLock" in html
+        assert "visibilitychange" in html
+
+    def test_translates_machine_errors_into_plain_korean(self):
+        """'network error' 같은 메시지는 받는 사람이 무엇을 해야 할지 알 수 없다."""
+        html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+        assert "friendlyError" in html
+        assert "다운로드가 중간에 끊겼습니다" in html
+        assert "메모리가 부족합니다" in html
+
+    def test_warns_before_a_large_download(self):
+        html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+        assert "다른 앱으로 나가면 중단됩니다" in html
+
     def test_offers_an_accurate_model_for_korean(self):
         """base 만으로는 한국어 정확도가 부족하다. 더 정확한 선택지가 있어야 한다."""
         html = (WEB_DIR / "index.html").read_text(encoding="utf-8")

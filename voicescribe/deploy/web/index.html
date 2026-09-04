@@ -152,7 +152,7 @@ let stallTimer = null;
 let workerFailed = false;      // 작업자가 한 번 실패하면 이후에는 바로 우회한다
 let mainThreadBusy = false;
 // 파일을 고칠 때마다 올린다. 브라우저가 예전 파일을 쓰지 않게 하는 용도.
-const APP_VERSION = "4";
+const APP_VERSION = "5";
 
 /* ---------- 보안 연결 확인 (마이크는 https 에서만 된다) ---------- */
 if (!window.isSecureContext) {
@@ -253,6 +253,16 @@ async function toMono16k(file) {
 }
 
 /* ---------- 실행 ---------- */
+$("model").addEventListener("change", () => {
+  const big = $("model").value.includes("large");
+  $("firstRun").innerHTML = big
+    ? "가장 정확한 모델은 <b>약 560MB</b> 를 내려받습니다. " +
+      "<b>와이파이</b>에서, 받는 동안 <b>이 화면을 그대로 두세요.</b> " +
+      "다른 앱으로 나가면 중단됩니다. (한 번 받으면 다음부터는 바로 열립니다)"
+    : "처음 한 번만 음성인식 모델을 내려받습니다. 그 뒤로는 저장되어 빠르게 열립니다.";
+  $("firstRun").classList.remove("hidden");
+});
+
 $("go").addEventListener("click", async () => {
   if (!picked) return;
   $("go").disabled = true;
@@ -277,7 +287,12 @@ $("go").addEventListener("click", async () => {
     diarize: $("diarize").checked,
   };
 
-  $("statusText").textContent = "모델 준비 중… (처음이면 시간이 걸립니다)";
+  leftDuringWork = false;
+  keepAwake();
+  const big = $("model").value.includes("large");
+  $("statusText").textContent = big
+    ? "모델 준비 중… 처음이면 시간이 걸립니다. 이 화면을 그대로 두세요."
+    : "모델 준비 중… (처음이면 시간이 걸립니다)";
   armStallNotice();
 
   // 1순위: 작업자에서 돌린다(화면이 멈추지 않는다).
@@ -288,6 +303,57 @@ $("go").addEventListener("click", async () => {
   }
   runOnMainThread(request);
 });
+
+let wakeLock = null;
+let leftDuringWork = false;
+
+/** 처리하는 동안 화면이 꺼지지 않게 한다. 화면이 꺼지면 다운로드가 끊긴다. */
+async function keepAwake() {
+  try {
+    if ("wakeLock" in navigator) wakeLock = await navigator.wakeLock.request("screen");
+  } catch {
+    // 지원하지 않는 브라우저도 있다. 없어도 동작에는 지장 없다.
+  }
+}
+
+function releaseAwake() {
+  try { wakeLock?.release(); } catch {}
+  wakeLock = null;
+}
+
+// 처리 중에 다른 앱으로 나갔는지 기억해 둔다(오류 원인 안내에 쓴다).
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden && !$("prog").classList.contains("hidden")) leftDuringWork = true;
+  // 돌아왔을 때 화면 꺼짐 방지를 다시 건다.
+  if (!document.hidden && !$("prog").classList.contains("hidden")) keepAwake();
+});
+
+/** 기계가 뱉는 영어 오류를 사람이 알아들을 말로 바꾼다. */
+function friendlyError(message) {
+  const raw = String(message || "");
+  const lower = raw.toLowerCase();
+  if (lower.includes("network") || lower.includes("failed to fetch") || lower.includes("load")) {
+    return (
+      "다운로드가 중간에 끊겼습니다.\n\n" +
+      (leftDuringWork
+        ? "받는 도중에 다른 화면으로 나가셨습니다. 휴대폰은 화면을 벗어나면 다운로드를 멈춥니다.\n"
+        : "") +
+      "이렇게 해보세요:\n" +
+      "  1. 와이파이에 연결하기\n" +
+      "  2. 다시 누르고 이 화면을 그대로 두기 (끝날 때까지)\n" +
+      "  3. 계속 안 되면 '정확도' 를 낮춰서 더 작은 것부터 받기\n\n" +
+      `(원인: ${raw})`
+    );
+  }
+  if (lower.includes("out of memory") || lower.includes("allocation")) {
+    return (
+      "휴대폰 메모리가 부족합니다.\n" +
+      "'정확도' 를 한 단계 낮춰서 다시 시도해 주세요.\n\n" +
+      `(원인: ${raw})`
+    );
+  }
+  return raw;
+}
 
 /** 진행 소식이 한동안 없을 때 "멈춘 게 아니다" 라고 알려 준다. */
 function armStallNotice() {
@@ -395,13 +461,15 @@ function killWorker() {
 }
 
 function showError(message) {
+  releaseAwake();
   $("prog").classList.add("hidden");
   $("err").classList.remove("hidden");
-  $("err").textContent = "❌ " + message;
+  $("err").textContent = "❌ " + friendlyError(message);
   $("go").disabled = !picked;
 }
 
 function showResult(d) {
+  releaseAwake();
   $("prog").classList.add("hidden");
   $("go").disabled = false;
   lastResult = d;
