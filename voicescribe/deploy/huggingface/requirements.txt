@@ -1,0 +1,5 @@
+gradio==5.49.1
+sherpa-onnx>=1.10
+faster-whisper>=1.0
+av>=12
+numpy>=1.24

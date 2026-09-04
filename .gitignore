@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+.coverage
+uv.lock
+
+# 받아쓰기 결과·모델 캐시
+/models/
+/output/
+/결과/
+.hf/

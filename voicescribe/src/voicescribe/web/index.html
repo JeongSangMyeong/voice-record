@@ -1,0 +1,444 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>VoiceScribe — 음성을 텍스트로</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --text: #16181d; --muted: #666d7a;
+    --line: #e2e5ea; --accent: #2f6df6; --accent-weak: #e8f0ff;
+    --ok: #12855a; --warn: #b7791f; --err: #c0392b; --radius: 12px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14161a; --panel: #1c1f25; --text: #e8eaee; --muted: #9aa3b2;
+      --line: #2c313a; --accent: #5b8cff; --accent-weak: #1e2a44;
+      --ok: #35c48c; --warn: #e0a83a; --err: #ef6d5e;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px 16px 64px; background: var(--bg); color: var(--text);
+    font-family: system-ui, -apple-system, "Segoe UI", "Apple SD Gothic Neo",
+                 "Malgun Gothic", "Noto Sans KR", sans-serif;
+    line-height: 1.6;
+  }
+  .wrap { max-width: 900px; margin: 0 auto; }
+  h1 { font-size: 26px; margin: 0 0 4px; letter-spacing: -0.02em; }
+  .sub { color: var(--muted); font-size: 14px; margin: 0 0 24px; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
+    padding: 20px; margin-bottom: 16px;
+  }
+  .drop {
+    border: 2px dashed var(--line); border-radius: var(--radius); padding: 32px 20px;
+    text-align: center; cursor: pointer; transition: .15s; background: transparent;
+  }
+  .drop:hover, .drop.over { border-color: var(--accent); background: var(--accent-weak); }
+  .drop b { font-size: 16px; }
+  .drop small { color: var(--muted); display: block; margin-top: 6px; }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+  .row > * { flex: none; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 14px; }
+  label.field { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px; }
+  select, input[type="text"], input[type="number"] {
+    width: 100%; padding: 9px 10px; border-radius: 8px; border: 1px solid var(--line);
+    background: var(--bg); color: var(--text); font-size: 14px; font-family: inherit;
+  }
+  button {
+    padding: 10px 18px; border-radius: 8px; border: 1px solid var(--line);
+    background: var(--panel); color: var(--text); font-size: 14px; cursor: pointer;
+    font-family: inherit; transition: .15s;
+  }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button.primary { background: var(--accent); color: #fff; border-color: var(--accent); font-weight: 600; }
+  button.primary:hover:not(:disabled) { filter: brightness(1.08); }
+  button.rec { background: var(--err); color: #fff; border-color: var(--err); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .chips { display: flex; gap: 8px; flex-wrap: wrap; }
+  .chip {
+    display: inline-flex; align-items: center; gap: 6px; padding: 6px 12px;
+    border: 1px solid var(--line); border-radius: 999px; cursor: pointer; font-size: 13px;
+    user-select: none;
+  }
+  .chip input { margin: 0; }
+  .chip.on { border-color: var(--accent); background: var(--accent-weak); }
+  .bar { height: 8px; background: var(--line); border-radius: 999px; overflow: hidden; }
+  .bar > i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .25s; }
+  .status { font-size: 13px; color: var(--muted); margin-top: 8px; }
+  .hidden { display: none !important; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+  td.time { white-space: nowrap; color: var(--muted); font-variant-numeric: tabular-nums; width: 1%; }
+  td.spk { white-space: nowrap; width: 1%; }
+  .spk span { background: var(--accent-weak); color: var(--accent); padding: 2px 8px; border-radius: 999px; font-size: 12px; }
+  .trans { color: var(--muted); font-size: 13px; display: block; margin-top: 4px; }
+  .meta { display: flex; gap: 18px; flex-wrap: wrap; font-size: 13px; color: var(--muted); margin-bottom: 14px; }
+  .meta b { color: var(--text); }
+  .notice { padding: 12px 14px; border-radius: 8px; font-size: 13px; margin-bottom: 14px; }
+  .notice.warn { background: rgba(183,121,31,.12); color: var(--warn); }
+  .notice.err { background: rgba(192,57,43,.12); color: var(--err); white-space: pre-wrap; }
+  .scroll { max-height: 460px; overflow: auto; }
+  .foot { text-align: center; color: var(--muted); font-size: 12px; margin-top: 28px; }
+  #recTime { font-variant-numeric: tabular-nums; color: var(--err); font-weight: 600; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🎙️ VoiceScribe</h1>
+  <p class="sub">녹음 파일을 100개 언어의 텍스트로 바꿉니다. 모든 처리는 이 컴퓨터 안에서 이루어지며 파일이 외부로 전송되지 않습니다.</p>
+
+  <div id="engineWarn" class="notice warn hidden"></div>
+
+  <div class="panel">
+    <div id="drop" class="drop">
+      <b>오디오 파일을 여기에 끌어다 놓거나 클릭해서 고르세요</b>
+      <small>mp3 · m4a · wav · webm · ogg · mp4 등 (최대 1GB)</small>
+      <input id="file" type="file" accept="audio/*,video/*" class="hidden" />
+    </div>
+    <div class="row" style="margin-top:14px">
+      <button id="recBtn">⏺ 마이크로 녹음</button>
+      <span id="recTime" class="hidden">0:00</span>
+      <span id="picked" class="status" style="margin:0"></span>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="grid">
+      <div>
+        <label class="field" for="language">음성의 언어</label>
+        <select id="language"><option value="auto">자동 감지</option></select>
+      </div>
+      <div>
+        <label class="field" for="model">모델 (클수록 정확·느림)</label>
+        <select id="model"></select>
+      </div>
+      <div>
+        <label class="field" for="translate">번역 (선택)</label>
+        <select id="translate"><option value="">번역 안 함</option></select>
+      </div>
+      <div>
+        <label class="field" for="prompt">전문용어 힌트 (선택)</label>
+        <input id="prompt" type="text" placeholder="예: 카카오, 리액트, 배포" />
+      </div>
+    </div>
+
+    <div style="margin-top:16px">
+      <label class="field">저장 형식</label>
+      <div class="chips" id="formats"></div>
+    </div>
+
+    <div style="margin-top:14px">
+      <label class="field">추가 옵션</label>
+      <div class="chips">
+        <label class="chip"><input type="checkbox" id="diarize" /> 화자 구분</label>
+        <label class="chip"><input type="checkbox" id="timestamps" /> 시간 표시</label>
+        <label class="chip"><input type="checkbox" id="bilingual" /> 원문+번역 나란히</label>
+      </div>
+    </div>
+
+    <div class="row" style="margin-top:20px">
+      <button id="go" class="primary" disabled>받아쓰기 시작</button>
+      <span id="hint" class="status" style="margin:0"></span>
+    </div>
+  </div>
+
+  <div id="progressPanel" class="panel hidden">
+    <div class="bar"><i id="barFill"></i></div>
+    <div class="status" id="statusText">준비 중…</div>
+  </div>
+
+  <div id="errPanel" class="notice err hidden"></div>
+
+  <div id="resultPanel" class="panel hidden">
+    <div class="meta" id="resultMeta"></div>
+    <div class="row" style="margin-bottom:14px">
+      <button id="copyBtn">📋 전체 복사</button>
+      <span id="dl" class="chips"></span>
+    </div>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>시간</th><th id="spkHead" class="hidden">화자</th><th>내용</th></tr></thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <p class="foot">VoiceScribe · 무료 · 오프라인 · 데이터가 이 컴퓨터를 떠나지 않습니다</p>
+</div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+let selectedFile = null, mediaRecorder = null, recChunks = [], recTimer = null, recStart = 0;
+
+function fmtTime(sec) {
+  sec = Math.max(0, Math.floor(sec || 0));
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  return h ? `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`
+           : `${m}:${String(s).padStart(2, "0")}`;
+}
+function fmtSize(bytes) {
+  if (bytes < 1024) return bytes + " B";
+  if (bytes < 1048576) return (bytes / 1024).toFixed(0) + " KB";
+  return (bytes / 1048576).toFixed(1) + " MB";
+}
+
+// ---------- 설정 불러오기 ----------
+async function loadConfig() {
+  const res = await fetch("/api/config");
+  const cfg = await res.json();
+
+  const lang = $("language");
+  const priority = ["ko", "en", "ja", "zh", "es", "fr", "de", "ru", "vi", "th", "id"];
+  const byCode = Object.fromEntries(cfg.languages.map((l) => [l.code, l]));
+  for (const code of priority) {
+    if (!byCode[code]) continue;
+    lang.appendChild(new Option(`${byCode[code].ko} (${code})`, code));
+  }
+  const divider = new Option("──────────", "");
+  divider.disabled = true;
+  lang.appendChild(divider);
+  for (const l of cfg.languages) {
+    if (priority.includes(l.code)) continue;
+    lang.appendChild(new Option(`${l.ko} (${l.code})`, l.code));
+  }
+
+  const model = $("model");
+  for (const [name, desc] of Object.entries(cfg.models)) {
+    model.appendChild(new Option(`${name} — ${desc}`, name));
+  }
+  model.value = cfg.models["base"] ? "base" : Object.keys(cfg.models)[0];
+
+  const translate = $("translate");
+  for (const code of priority) {
+    if (byCode[code]) translate.appendChild(new Option(`${byCode[code].ko} (${code})`, code));
+  }
+
+  const formats = $("formats");
+  for (const [name, desc] of Object.entries(cfg.formats)) {
+    const label = document.createElement("label");
+    label.className = "chip" + (name === "txt" ? " on" : "");
+    label.title = desc;
+    label.innerHTML = `<input type="checkbox" value="${name}" ${name === "txt" ? "checked" : ""}/> ${name}`;
+    label.querySelector("input").addEventListener("change", (e) => {
+      label.classList.toggle("on", e.target.checked);
+    });
+    formats.appendChild(label);
+  }
+
+  const realEngines = cfg.engines.filter((e) => e.available && e.name !== "demo");
+  if (realEngines.length === 0) {
+    const warn = $("engineWarn");
+    warn.classList.remove("hidden");
+    warn.innerHTML = "⚠️ 음성인식 엔진이 설치되지 않아 <b>실제 받아쓰기를 할 수 없습니다</b>. " +
+      "터미널에서 <code>pip install \"voicescribe[stt]\"</code> 를 실행한 뒤 새로고침하세요. " +
+      "(지금은 발화 구간만 표시됩니다)";
+  }
+  const noTranslator = !cfg.translators.some((t) => t.available);
+  if (noTranslator) {
+    $("translate").title = "번역기가 설치되지 않았습니다: pip install \"voicescribe[translate]\"";
+  }
+}
+
+// ---------- 파일 선택 ----------
+function setFile(file) {
+  selectedFile = file;
+  $("picked").textContent = file ? `선택됨: ${file.name} (${fmtSize(file.size)})` : "";
+  $("go").disabled = !file;
+}
+$("drop").addEventListener("click", () => $("file").click());
+$("file").addEventListener("change", (e) => { if (e.target.files[0]) setFile(e.target.files[0]); });
+["dragenter", "dragover"].forEach((ev) =>
+  $("drop").addEventListener(ev, (e) => { e.preventDefault(); $("drop").classList.add("over"); }));
+["dragleave", "drop"].forEach((ev) =>
+  $("drop").addEventListener(ev, (e) => { e.preventDefault(); $("drop").classList.remove("over"); }));
+$("drop").addEventListener("drop", (e) => {
+  if (e.dataTransfer.files[0]) setFile(e.dataTransfer.files[0]);
+});
+
+// ---------- 마이크 녹음 ----------
+$("recBtn").addEventListener("click", async () => {
+  if (mediaRecorder && mediaRecorder.state === "recording") {
+    mediaRecorder.stop();
+    return;
+  }
+  if (!navigator.mediaDevices || !window.MediaRecorder) {
+    alert("이 브라우저는 녹음을 지원하지 않습니다. 파일 업로드를 사용하세요.");
+    return;
+  }
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (err) {
+    alert("마이크 권한이 필요합니다: " + err.message);
+    return;
+  }
+  recChunks = [];
+  const mime = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4"].find(
+    (m) => MediaRecorder.isTypeSupported(m)) || "";
+  mediaRecorder = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
+  mediaRecorder.ondataavailable = (e) => { if (e.data.size) recChunks.push(e.data); };
+  mediaRecorder.onstop = () => {
+    stream.getTracks().forEach((t) => t.stop());
+    clearInterval(recTimer);
+    $("recBtn").textContent = "⏺ 마이크로 녹음";
+    $("recBtn").classList.remove("rec");
+    $("recTime").classList.add("hidden");
+    const ext = (mediaRecorder.mimeType || "").includes("mp4") ? "m4a" : "webm";
+    const blob = new Blob(recChunks, { type: mediaRecorder.mimeType || "audio/webm" });
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+    setFile(new File([blob], `녹음-${stamp}.${ext}`, { type: blob.type }));
+  };
+  mediaRecorder.start();
+  recStart = Date.now();
+  $("recBtn").textContent = "⏹ 녹음 중지";
+  $("recBtn").classList.add("rec");
+  $("recTime").classList.remove("hidden");
+  recTimer = setInterval(() => {
+    $("recTime").textContent = fmtTime((Date.now() - recStart) / 1000);
+  }, 250);
+});
+
+// ---------- 받아쓰기 실행 ----------
+$("go").addEventListener("click", async () => {
+  if (!selectedFile) return;
+  const formats = [...document.querySelectorAll("#formats input:checked")].map((i) => i.value);
+  if (!formats.length) { alert("저장 형식을 최소 하나 선택하세요."); return; }
+
+  $("go").disabled = true;
+  $("errPanel").classList.add("hidden");
+  $("resultPanel").classList.add("hidden");
+  $("progressPanel").classList.remove("hidden");
+  $("barFill").style.width = "0%";
+  $("statusText").textContent = "업로드 중…";
+
+  const form = new FormData();
+  form.append("file", selectedFile);
+  form.append("language", $("language").value);
+  form.append("model", $("model").value);
+  form.append("formats", formats.join(","));
+  form.append("translate_to", $("translate").value);
+  form.append("diarize", $("diarize").checked);
+  form.append("timestamps", $("timestamps").checked);
+  form.append("bilingual", $("bilingual").checked);
+  form.append("prompt", $("prompt").value);
+
+  let jobId;
+  try {
+    const res = await fetch("/api/jobs", { method: "POST", body: form });
+    if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
+    jobId = (await res.json()).id;
+  } catch (err) {
+    showError("업로드 실패: " + err.message);
+    return;
+  }
+
+  const source = new EventSource(`/api/jobs/${jobId}/events`);
+  source.onmessage = (event) => {
+    const job = JSON.parse(event.data);
+    $("barFill").style.width = (job.fraction * 100).toFixed(1) + "%";
+    $("statusText").textContent = job.message || job.status;
+    if (job.status === "실패") { source.close(); showError(job.error || "알 수 없는 오류"); }
+    if (job.status === "완료") { source.close(); showResult(jobId, job); }
+  };
+  source.onerror = () => {
+    source.close();
+    fetch(`/api/jobs/${jobId}`).then((r) => r.json()).then((job) => {
+      if (job.status === "완료") showResult(jobId, job);
+      else showError("서버 연결이 끊어졌습니다. (" + (job.error || job.status) + ")");
+    }).catch(() => showError("서버 연결이 끊어졌습니다."));
+  };
+});
+
+function showError(message) {
+  $("progressPanel").classList.add("hidden");
+  const panel = $("errPanel");
+  panel.textContent = "❌ " + message;
+  panel.classList.remove("hidden");
+  $("go").disabled = !selectedFile;
+}
+
+function showResult(jobId, job) {
+  $("progressPanel").classList.add("hidden");
+  $("go").disabled = false;
+  const result = job.result;
+  if (!result) { showError("결과가 비어 있습니다."); return; }
+
+  const hasSpeakers = (result.speakers || []).length > 0;
+  $("spkHead").classList.toggle("hidden", !hasSpeakers);
+
+  $("resultMeta").innerHTML = [
+    `언어 <b>${result.language}</b>`,
+    `길이 <b>${fmtTime(result.duration)}</b>`,
+    `구간 <b>${result.segment_count}개</b>`,
+    hasSpeakers ? `화자 <b>${result.speakers.length}명</b>` : "",
+    `엔진 <b>${result.engine}</b>`,
+  ].filter(Boolean).join("");
+
+  const rows = $("rows");
+  rows.innerHTML = "";
+  for (const seg of result.segments) {
+    const tr = document.createElement("tr");
+    const time = document.createElement("td");
+    time.className = "time";
+    time.textContent = fmtTime(seg.start);
+    tr.appendChild(time);
+    if (hasSpeakers) {
+      const spk = document.createElement("td");
+      spk.className = "spk";
+      spk.innerHTML = seg.speaker ? `<span>${escapeHtml(seg.speaker)}</span>` : "";
+      tr.appendChild(spk);
+    }
+    const body = document.createElement("td");
+    body.textContent = seg.text || "";
+    if (seg.translation) {
+      const em = document.createElement("span");
+      em.className = "trans";
+      em.textContent = seg.translation;
+      body.appendChild(em);
+    }
+    tr.appendChild(body);
+    rows.appendChild(tr);
+  }
+
+  const dl = $("dl");
+  dl.innerHTML = "";
+  for (const fmt of job.formats || []) {
+    const a = document.createElement("a");
+    a.className = "chip";
+    a.href = `/api/jobs/${jobId}/download?format=${encodeURIComponent(fmt)}`;
+    a.textContent = `⬇ .${fmt}`;
+    a.style.textDecoration = "none";
+    a.style.color = "inherit";
+    dl.appendChild(a);
+  }
+
+  $("copyBtn").onclick = async () => {
+    const text = result.segments.map((s) => s.text).join("\n");
+    try {
+      await navigator.clipboard.writeText(text);
+      $("copyBtn").textContent = "✅ 복사됨";
+      setTimeout(() => ($("copyBtn").textContent = "📋 전체 복사"), 1600);
+    } catch {
+      alert("복사에 실패했습니다. 텍스트를 직접 선택해 주세요.");
+    }
+  };
+
+  $("resultPanel").classList.remove("hidden");
+}
+
+function escapeHtml(value) {
+  const div = document.createElement("div");
+  div.textContent = value;
+  return div.innerHTML;
+}
+
+loadConfig().catch((err) => {
+  $("hint").textContent = "설정을 불러오지 못했습니다: " + err.message;
+});
+</script>
+</body>
+</html>

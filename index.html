@@ -1,0 +1,335 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="theme-color" content="#2f6df6" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-title" content="VoiceScribe" />
+<title>VoiceScribe — 음성을 텍스트로</title>
+<style>
+  :root {
+    --bg:#f6f7f9; --panel:#fff; --text:#16181d; --muted:#667;
+    --line:#e2e5ea; --accent:#2f6df6; --accent-weak:#e8f0ff;
+    --warn:#b7791f; --err:#c0392b; --ok:#12855a; --radius:14px;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{ --bg:#14161a; --panel:#1c1f25; --text:#e8eaee; --muted:#9aa3b2;
+           --line:#2c313a; --accent:#5b8cff; --accent-weak:#1e2a44;
+           --warn:#e0a83a; --err:#ef6d5e; --ok:#35c48c; }
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; padding:20px 16px calc(48px + env(safe-area-inset-bottom));
+    background:var(--bg); color:var(--text); line-height:1.6;
+    font-family:system-ui,-apple-system,"Apple SD Gothic Neo","Malgun Gothic","Noto Sans KR",sans-serif;
+    -webkit-text-size-adjust:100%;
+  }
+  .wrap{max-width:640px;margin:0 auto}
+  h1{font-size:24px;margin:0 0 4px;letter-spacing:-.02em}
+  .sub{color:var(--muted);font-size:14px;margin:0 0 20px}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:18px;margin-bottom:14px}
+  .drop{border:2px dashed var(--line);border-radius:var(--radius);padding:28px 16px;text-align:center;cursor:pointer}
+  .drop:active,.drop.over{border-color:var(--accent);background:var(--accent-weak)}
+  .drop b{font-size:16px} .drop small{display:block;color:var(--muted);margin-top:6px}
+  label.f{display:block;font-size:13px;color:var(--muted);margin-bottom:4px}
+  select{width:100%;padding:12px 10px;border-radius:10px;border:1px solid var(--line);
+         background:var(--bg);color:var(--text);font-size:16px;font-family:inherit}
+  button{padding:14px 18px;border-radius:10px;border:1px solid var(--line);background:var(--panel);
+         color:var(--text);font-size:16px;font-family:inherit;cursor:pointer;width:100%}
+  button.primary{background:var(--accent);color:#fff;border-color:var(--accent);font-weight:600}
+  button.rec{background:var(--err);color:#fff;border-color:var(--err)}
+  button:disabled{opacity:.45}
+  .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+  .row>button{width:auto;flex:1;min-width:140px}
+  .grid{display:grid;grid-template-columns:1fr;gap:12px}
+  @media(min-width:520px){.grid{grid-template-columns:1fr 1fr}}
+  .bar{height:8px;background:var(--line);border-radius:99px;overflow:hidden}
+  .bar>i{display:block;height:100%;width:0;background:var(--accent);transition:width .3s}
+  .status{font-size:13px;color:var(--muted);margin-top:8px}
+  .hidden{display:none!important}
+  .note{padding:12px 14px;border-radius:10px;font-size:13px;margin-bottom:12px}
+  .note.warn{background:rgba(183,121,31,.13);color:var(--warn)}
+  .note.err{background:rgba(192,57,43,.13);color:var(--err);white-space:pre-wrap}
+  .note.info{background:var(--accent-weak);color:var(--accent)}
+  #out{width:100%;min-height:220px;padding:12px;border-radius:10px;border:1px solid var(--line);
+       background:var(--bg);color:var(--text);font-size:15px;font-family:inherit;line-height:1.7;resize:vertical}
+  .meta{display:flex;gap:14px;flex-wrap:wrap;font-size:13px;color:var(--muted);margin-bottom:10px}
+  .meta b{color:var(--text)}
+  .foot{text-align:center;color:var(--muted);font-size:12px;margin-top:24px;line-height:1.8}
+  #recTime{font-variant-numeric:tabular-nums;color:var(--err);font-weight:700;font-size:18px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🎙️ VoiceScribe</h1>
+  <p class="sub">녹음을 텍스트로 바꿔 드립니다. <b>변환은 이 기기 안에서만</b> 이루어지고 녹음이 어디로도 전송되지 않습니다.</p>
+
+  <div id="insecure" class="note err hidden"></div>
+  <div id="firstRun" class="note info">
+    처음 한 번만 음성인식 모델을 내려받습니다(수십 MB). 그 뒤로는 저장되어 빠르게 열립니다.
+  </div>
+
+  <div class="panel">
+    <div id="drop" class="drop">
+      <b>녹음 파일 고르기</b>
+      <small>m4a · mp3 · wav · mp4 등</small>
+      <input id="file" type="file" accept="audio/*,video/*" class="hidden" />
+    </div>
+    <div class="row" style="margin-top:12px">
+      <button id="recBtn">⏺ 마이크로 녹음</button>
+      <span id="recTime" class="hidden">0:00</span>
+    </div>
+    <div id="picked" class="status"></div>
+  </div>
+
+  <div class="panel">
+    <div class="grid">
+      <div>
+        <label class="f" for="lang">언어</label>
+        <select id="lang">
+          <option value="ko" selected>한국어</option>
+          <option value="en">영어</option>
+          <option value="ja">일본어</option>
+          <option value="zh">중국어</option>
+          <option value="es">스페인어</option>
+          <option value="fr">프랑스어</option>
+          <option value="de">독일어</option>
+          <option value="vi">베트남어</option>
+          <option value="auto">자동 감지</option>
+        </select>
+      </div>
+      <div>
+        <label class="f" for="model">정확도</label>
+        <select id="model">
+          <option value="onnx-community/whisper-base">보통 — 빠름 (약 80MB)</option>
+          <option value="onnx-community/whisper-small" selected>좋음 — 권장 (약 250MB)</option>
+          <option value="onnx-community/whisper-tiny">낮음 — 가장 빠름 (약 40MB)</option>
+        </select>
+      </div>
+    </div>
+    <button id="go" class="primary" style="margin-top:16px" disabled>받아쓰기 시작</button>
+  </div>
+
+  <div id="prog" class="panel hidden">
+    <div class="bar"><i id="fill"></i></div>
+    <div class="status" id="statusText">준비 중…</div>
+  </div>
+
+  <div id="err" class="note err hidden"></div>
+
+  <div id="result" class="panel hidden">
+    <div class="meta" id="rmeta"></div>
+    <textarea id="out" readonly></textarea>
+    <div class="row" style="margin-top:12px">
+      <button id="copy">📋 복사</button>
+      <button id="save">⬇ 파일로 저장</button>
+    </div>
+  </div>
+
+  <p class="foot">
+    변환은 이 기기 안에서만 이루어집니다.<br />
+    녹음 파일이 서버로 전송되지 않습니다.
+  </p>
+</div>
+
+<script type="module">
+"use strict";
+const $ = (id) => document.getElementById(id);
+const SAMPLE_RATE = 16000;
+let picked = null, recorder = null, chunks = [], timer = null, recStart = 0, worker = null;
+let lastResult = null;
+
+/* ---------- 보안 연결 확인 (마이크는 https 에서만 된다) ---------- */
+if (!window.isSecureContext) {
+  const box = $("insecure");
+  box.classList.remove("hidden");
+  box.textContent =
+    "이 페이지가 보안 연결(https)이 아니라서 마이크 녹음을 쓸 수 없습니다.\n" +
+    "녹음 파일을 골라서 올리는 것은 그대로 됩니다.";
+}
+
+/* ---------- 유틸 ---------- */
+const fmtTime = (s) => {
+  s = Math.max(0, Math.floor(s || 0));
+  const h = (s / 3600) | 0, m = ((s % 3600) / 60) | 0, x = s % 60;
+  return h ? `${h}:${String(m).padStart(2,"0")}:${String(x).padStart(2,"0")}`
+           : `${m}:${String(x).padStart(2,"0")}`;
+};
+const fmtSize = (b) => b < 1048576 ? `${(b/1024)|0} KB` : `${(b/1048576).toFixed(1)} MB`;
+
+function setFile(f) {
+  picked = f;
+  $("picked").textContent = f ? `선택됨: ${f.name} (${fmtSize(f.size)})` : "";
+  $("go").disabled = !f;
+}
+
+/* ---------- 파일 고르기 ---------- */
+$("drop").addEventListener("click", () => $("file").click());
+$("file").addEventListener("change", (e) => e.target.files[0] && setFile(e.target.files[0]));
+["dragenter","dragover"].forEach(ev => $("drop").addEventListener(ev, (e) => {
+  e.preventDefault(); $("drop").classList.add("over");
+}));
+["dragleave","drop"].forEach(ev => $("drop").addEventListener(ev, (e) => {
+  e.preventDefault(); $("drop").classList.remove("over");
+}));
+$("drop").addEventListener("drop", (e) => e.dataTransfer.files[0] && setFile(e.dataTransfer.files[0]));
+
+/* ---------- 마이크 녹음 ---------- */
+$("recBtn").addEventListener("click", async () => {
+  if (recorder && recorder.state === "recording") { recorder.stop(); return; }
+  if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
+    alert("이 브라우저에서는 녹음을 지원하지 않습니다. 녹음 앱으로 녹음한 파일을 올려 주세요.");
+    return;
+  }
+  let stream;
+  try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
+  catch (e) { alert("마이크 권한이 필요합니다: " + e.message); return; }
+
+  chunks = [];
+  // 아이폰 사파리는 audio/mp4 를 만든다. 지원하는 형식을 골라 준다.
+  const mime = ["audio/mp4","audio/webm;codecs=opus","audio/webm"]
+    .find(m => MediaRecorder.isTypeSupported(m)) || "";
+  recorder = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
+  recorder.ondataavailable = (e) => e.data.size && chunks.push(e.data);
+  recorder.onstop = () => {
+    stream.getTracks().forEach(t => t.stop());
+    clearInterval(timer);
+    $("recBtn").textContent = "⏺ 마이크로 녹음";
+    $("recBtn").classList.remove("rec");
+    $("recTime").classList.add("hidden");
+    const type = recorder.mimeType || "audio/mp4";
+    const ext = type.includes("webm") ? "webm" : "m4a";
+    const stamp = new Date().toISOString().slice(0,16).replace(/[:T]/g,"-");
+    setFile(new File([new Blob(chunks, { type })], `녹음-${stamp}.${ext}`, { type }));
+  };
+  recorder.start();
+  recStart = Date.now();
+  $("recBtn").textContent = "⏹ 녹음 중지";
+  $("recBtn").classList.add("rec");
+  $("recTime").classList.remove("hidden");
+  timer = setInterval(() => $("recTime").textContent = fmtTime((Date.now()-recStart)/1000), 250);
+});
+
+/* ---------- 오디오 디코딩 (16kHz 모노로) ---------- */
+async function toMono16k(file) {
+  const buffer = await file.arrayBuffer();
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  const decodeCtx = new Ctx();
+  let decoded;
+  try {
+    decoded = await decodeCtx.decodeAudioData(buffer);
+  } catch {
+    throw new Error("이 오디오 형식을 읽지 못했습니다. m4a·mp3·wav 파일을 사용해 주세요.");
+  } finally {
+    decodeCtx.close();
+  }
+  if (decoded.sampleRate === SAMPLE_RATE && decoded.numberOfChannels === 1) {
+    return decoded.getChannelData(0);
+  }
+  // 16kHz 모노로 다시 그린다.
+  const frames = Math.ceil(decoded.duration * SAMPLE_RATE);
+  const Offline = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+  const offline = new Offline(1, frames, SAMPLE_RATE);
+  const source = offline.createBufferSource();
+  source.buffer = decoded;
+  source.connect(offline.destination);
+  source.start();
+  return (await offline.startRendering()).getChannelData(0);
+}
+
+/* ---------- 실행 ---------- */
+$("go").addEventListener("click", async () => {
+  if (!picked) return;
+  $("go").disabled = true;
+  $("err").classList.add("hidden");
+  $("result").classList.add("hidden");
+  $("prog").classList.remove("hidden");
+  $("fill").style.width = "2%";
+  $("statusText").textContent = "소리를 읽는 중…";
+
+  let audio;
+  try {
+    audio = await toMono16k(picked);
+  } catch (e) { return showError(e.message); }
+
+  if (audio.length < SAMPLE_RATE * 0.2) return showError("소리가 너무 짧습니다.");
+
+  if (!worker) {
+    worker = new Worker(new URL("./worker.js", import.meta.url), { type: "module" });
+    worker.addEventListener("message", onWorker);
+    worker.addEventListener("error", (e) => showError("작업자 오류: " + e.message));
+  }
+  $("statusText").textContent = "모델 준비 중…";
+  worker.postMessage({
+    audio, model: $("model").value, language: $("lang").value, sampleRate: SAMPLE_RATE,
+  });
+});
+
+const downloaded = new Map();
+function onWorker(event) {
+  const d = event.data;
+  if (d.type === "download") {
+    downloaded.set(d.file, d.loaded / d.total);
+    const values = [...downloaded.values()];
+    const ratio = values.reduce((a,b)=>a+b,0) / values.length;
+    $("fill").style.width = `${5 + ratio * 45}%`;
+    $("statusText").textContent = `음성인식 모델 내려받는 중… ${Math.round(ratio*100)}%`;
+    $("firstRun").classList.add("hidden");
+  } else if (d.type === "device") {
+    $("statusText").textContent = d.device === "webgpu"
+      ? "빠른 모드(WebGPU)로 처리합니다" : "처리 중… (이 기기에서는 시간이 조금 걸립니다)";
+  } else if (d.type === "status") {
+    if (d.text === "받아쓰는 중") $("fill").style.width = "60%";
+    $("statusText").textContent = d.text + "…";
+  } else if (d.type === "done") {
+    $("fill").style.width = "100%";
+    showResult(d);
+  } else if (d.type === "error") {
+    showError(d.message);
+  }
+}
+
+function showError(message) {
+  $("prog").classList.add("hidden");
+  $("err").classList.remove("hidden");
+  $("err").textContent = "❌ " + message;
+  $("go").disabled = !picked;
+}
+
+function showResult(d) {
+  $("prog").classList.add("hidden");
+  $("go").disabled = false;
+  lastResult = d;
+  $("out").value = d.text || "(말소리를 찾지 못했습니다)";
+  const speed = d.duration > 0 && d.elapsed > 0 ? (d.duration / d.elapsed).toFixed(1) : "?";
+  $("rmeta").innerHTML =
+    `길이 <b>${fmtTime(d.duration)}</b>` +
+    `처리 <b>${d.elapsed.toFixed(0)}초</b>` +
+    `속도 <b>x${speed}</b>` +
+    `모드 <b>${d.device === "webgpu" ? "WebGPU" : "일반"}</b>`;
+  $("result").classList.remove("hidden");
+  $("result").scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+$("copy").addEventListener("click", async () => {
+  try {
+    await navigator.clipboard.writeText($("out").value);
+    $("copy").textContent = "✅ 복사됨";
+  } catch {
+    $("out").select();                 // 클립보드가 막힌 경우 직접 선택하게 한다
+    $("copy").textContent = "길게 눌러 복사하세요";
+  }
+  setTimeout(() => $("copy").textContent = "📋 복사", 1800);
+});
+
+$("save").addEventListener("click", () => {
+  const name = (picked?.name || "받아쓰기").replace(/\.[^.]+$/, "") + ".txt";
+  const url = URL.createObjectURL(new Blob([$("out").value], { type: "text/plain;charset=utf-8" }));
+  const a = document.createElement("a");
+  a.href = url; a.download = name; a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+});
+</script>
+</body>
+</html>

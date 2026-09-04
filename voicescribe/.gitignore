@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+.venv/
+.probe/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# 받아쓰기 결과·모델 캐시 (루트에 있는 것만 제외해야 한다.
+# 슬래시를 앞에 붙이지 않으면 src/voicescribe/output/ 소스까지 제외되어 버린다)
+/models/
+/output/
+/출력/
+/결과/
+.hf/
+
+# uv 잠금 파일 (라이브러리라 선택 설치 조합이 다양해 고정하지 않는다)
+uv.lock

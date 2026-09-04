@@ -1,0 +1,37 @@
+# GitHub Pages 자동 배포 설정 (선택 사항)
+#
+# 파일을 저장소 맨 위가 아니라 하위 폴더에 두고 싶을 때 씁니다.
+# 이 파일을 저장소의 .github/workflows/deploy-web.yml 로 복사한 뒤,
+# 저장소 Settings → Pages → Source 를 "GitHub Actions" 로 바꾸세요.
+
+name: 웹페이지 배포
+
+on:
+  push:
+    branches: [main]
+    paths: ["voicescribe/deploy/web/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: voicescribe/deploy/web
+      - id: deployment
+        uses: actions/deploy-pages@v4
