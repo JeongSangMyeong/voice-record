@@ -118,7 +118,7 @@
     </label>
     <label class="chip-row" id="notifyRow" style="display:none;align-items:center;gap:8px;margin-top:10px;font-size:15px;cursor:pointer">
       <input type="checkbox" id="notify" style="width:20px;height:20px" />
-      다 되면 휴대폰 알림으로 알려주기
+      휴대폰을 다른 데 써도 계속 돌리고, 끝나면 알림 받기
     </label>
     <div id="notifyNote" class="status hidden" style="margin-top:6px"></div>
     <button id="go" class="primary" style="margin-top:14px" disabled>받아쓰기 시작</button>
@@ -176,7 +176,7 @@ let cancelled = false;
 let workerFailed = false;      // 작업자가 한 번 실패하면 이후에는 바로 우회한다
 let mainThreadBusy = false;
 // 파일을 고칠 때마다 올린다. 브라우저가 예전 파일을 쓰지 않게 하는 용도.
-const APP_VERSION = "18";
+const APP_VERSION = "20";
 
 /* ---------- 보안 연결 확인 (마이크는 https 에서만 된다) ---------- */
 if (!window.isSecureContext) {
@@ -384,6 +384,7 @@ $("go").addEventListener("click", async () => {
   currentPhase = "";
   downloadBytes.clear();
   keepAwake();
+  if ($("notify")?.checked) startKeepAlive();
   const big = $("model").value.includes("large");
   $("statusText").textContent = big
     ? "모델 준비 중… 처음이면 시간이 걸립니다. 이 화면을 그대로 두세요."
@@ -398,6 +399,48 @@ $("go").addEventListener("click", async () => {
   }
   runOnMainThread(request);
 });
+
+/* ---------- 배경에서 계속 돌리기 ---------- */
+
+let keepAliveContext = null;
+
+/**
+ * 다른 앱으로 나가도 작업이 멈추지 않게 한다.
+ *
+ * 안드로이드 크롬은 가려진 채 '소리가 나지 않는' 탭을 약 5분 뒤 얼려 버린다.
+ * 소리를 내는 탭은 예외다. 그래서 사람이 못 듣는 아주 작은 소리를 흘려 둔다.
+ *
+ * 주의: 소리 크기가 정확히 0 이면 소용이 없다. 실측 결과 크기 0 은 소리가
+ * 없는 것과 똑같이 취급되어 그대로 멈췄고(초당 1회), 0.001 로 두자
+ * 가려진 상태에서도 그대로 돌았다(초당 240회).
+ *
+ * 아이폰은 이 방법으로도 안 된다. 화면을 벗어나면 그냥 멈춘다.
+ */
+function startKeepAlive() {
+  if (keepAliveContext) return;
+  try {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return;
+    const context = new Ctx();
+    const oscillator = context.createOscillator();
+    const gain = context.createGain();
+    gain.gain.value = 0.001;      // 들리지 않지만 '소리 없음' 으로도 치지 않는 크기
+    oscillator.frequency.value = 60;
+    oscillator.connect(gain);
+    gain.connect(context.destination);
+    oscillator.start();
+    keepAliveContext = context;
+    // 파일을 읽는 동안 시간이 흘러 자동 재생 허가가 식었을 수 있다. 한 번 깨운다.
+    if (context.state === "suspended") context.resume().catch(() => {});
+  } catch {
+    // 안 되는 브라우저에서도 작업 자체에는 지장이 없다.
+  }
+}
+
+function stopKeepAlive() {
+  try { keepAliveContext?.close(); } catch {}
+  keepAliveContext = null;
+}
 
 /* ---------- 휴대폰 알림 ---------- */
 
@@ -462,7 +505,10 @@ if (canNotify()) {
     const note = $("notifyNote");
     note.classList.remove("hidden");
     if (result === "granted") {
-      note.textContent = "다 되면 알림이 옵니다. 화면을 꺼 두어도 됩니다.";
+      note.innerHTML =
+        "다른 앱을 써도 계속 돌아가고, 다 되면 알림이 옵니다.<br />" +
+        "멈추지 않게 <b>들리지 않는 소리</b>를 재생하므로 브라우저에 소리 표시가 뜹니다.<br />" +
+        "<b>아이폰은</b> 화면을 벗어나면 멈춥니다. 이 화면을 켜 둔 채로 두세요.";
     } else {
       $("notify").checked = false;
       note.textContent =
@@ -484,10 +530,11 @@ window.__transcribing = false;
 
 /** 처리하는 동안 화면이 꺼지지 않게 한다. 화면이 꺼지면 다운로드가 끊긴다. */
 async function keepAwake() {
+  if (wakeLock && !wakeLock.released) return;   // 이미 걸려 있으면 또 걸지 않는다
   try {
     if ("wakeLock" in navigator) wakeLock = await navigator.wakeLock.request("screen");
   } catch {
-    // 지원하지 않는 브라우저도 있다. 없어도 동작에는 지장 없다.
+    // 화면이 가려진 동안에는 브라우저가 거절한다. 없어도 동작에는 지장 없다.
   }
 }
 
@@ -500,7 +547,10 @@ function releaseAwake() {
 document.addEventListener("visibilitychange", () => {
   if (document.hidden && !$("prog").classList.contains("hidden")) leftDuringWork = true;
   // 돌아왔을 때 화면 꺼짐 방지를 다시 건다.
-  if (!document.hidden && !$("prog").classList.contains("hidden")) keepAwake();
+  if (!document.hidden && !$("prog").classList.contains("hidden")) {
+    keepAwake();
+    if (keepAliveContext?.state === "suspended") keepAliveContext.resume().catch(() => {});
+  }
 });
 
 /** 기계가 뱉는 영어 오류를 사람이 알아들을 말로 바꾼다. */
@@ -643,7 +693,8 @@ function onWorker(event) {
     if (d.phase === "loading") {
       $("statusText").textContent = "모델 준비 중…";
     } else if (d.phase === "transcribing") {
-      releaseAwake();   // 다운로드가 끝났으면 화면을 붙잡아 둘 이유가 없다
+      // 여기서 화면 꺼짐 방지를 풀면 안 된다. 받아쓰기가 제일 오래 걸리는데
+      // 그 사이에 화면이 자동으로 꺼지면 작업이 멈춘다(아이폰은 특히 빨리).
       $("fill").style.width = "55%";
       planTotal = 0;
       $("statusText").textContent = onMainThread
@@ -693,6 +744,7 @@ function formatResult(d) {
 
 $("stop").addEventListener("click", () => {
   window.__transcribing = false;
+  stopKeepAlive();
   cancelled = true;
   killWorker();                 // 작업자를 즉시 끝낸다
   releaseAwake();
@@ -717,6 +769,7 @@ function killWorker() {
 
 function showError(message) {
   window.__transcribing = false;
+  stopKeepAlive();
   if (wantsNotice()) showNotice("받아쓰기가 중간에 멈췄습니다", friendlyError(message).split("\n")[0]);
   releaseAwake();
   $("prog").classList.add("hidden");
@@ -727,6 +780,7 @@ function showError(message) {
 
 function showResult(d) {
   window.__transcribing = false;
+  stopKeepAlive();
   if (wantsNotice()) {
     showNotice(
       "받아쓰기가 끝났습니다",

@@ -488,6 +488,46 @@ class TestBrowserOnlyWebApp:
         # 공유가 안 되는 기기를 위해 내려받기 경로는 남아 있어야 한다
         assert "a.download = name" in html
 
+    def test_screen_stays_awake_through_the_whole_job(self):
+        """받아쓰기가 제일 오래 걸리는데, 그 단계에서 화면 꺼짐 방지를 풀고 있었다.
+
+        그러면 휴대폰이 자동으로 화면을 끄고 작업이 멈춘다(아이폰은 특히 빠르다).
+        화면 꺼짐 방지는 시작부터 끝(완료·실패·중지)까지 유지해야 한다.
+        """
+        html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+        start = html.index('d.phase === "transcribing"')
+        branch = html[start : start + 500]
+        assert "releaseAwake()" not in branch, (
+            "받아쓰기 단계에서 화면 꺼짐 방지를 풀고 있습니다. 작업이 중간에 멈춥니다."
+        )
+        assert "if (wakeLock && !wakeLock.released) return;" in html, (
+            "화면 꺼짐 방지가 겹쳐 쌓입니다"
+        )
+
+    def test_background_keepalive_uses_audible_gain(self):
+        """가려진 탭을 멈추지 않게 하려면 '소리가 나는' 상태여야 한다.
+
+        크기가 정확히 0 이면 브라우저가 소리 없음으로 보고 그대로 멈춘다.
+        들리지는 않지만 0 은 아닌 크기를 써야 한다.
+        """
+        html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+        assert "startKeepAlive" in html and "stopKeepAlive" in html
+        match = re.search(r"gain\.gain\.value\s*=\s*([0-9.]+)", html)
+        assert match, "배경 유지용 소리 크기를 찾지 못했습니다"
+        value = float(match.group(1))
+        assert 0 < value <= 0.01, f"크기가 {value} 입니다. 0 이면 소용없고 너무 크면 들립니다"
+        # 작업이 끝나면 반드시 꺼야 한다
+        for marker in ("function showResult", "function showError", '$("stop").addEventListener'):
+            spot = html.index(marker)
+            assert "stopKeepAlive()" in html[spot : spot + 400], f"{marker} 에서 소리를 끄지 않습니다"
+
+    def test_keepalive_is_opt_in_and_disclosed(self):
+        """소리를 몰래 재생하면 안 된다. 사용자가 켤 때만, 사실을 알리고 켠다."""
+        html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+        assert 'if ($("notify")?.checked) startKeepAlive();' in html, "동의 없이 켜집니다"
+        assert "들리지 않는 소리" in html, "소리를 재생한다는 사실을 알리지 않습니다"
+        assert "아이폰" in html, "아이폰에서는 안 된다는 안내가 없습니다"
+
     def test_web_files_at_the_root_match_the_deploy_copy(self):
         """뿌리의 파일이 실제로 배포되는 파일이다. 테스트는 배포본만 본다.
 
