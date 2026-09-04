@@ -57,6 +57,49 @@ async function loadLibrary() {
   lib.env.allowLocalModels = false; // 원격 모델만 쓴다
 }
 
+/**
+ * 모델마다 실제로 올라와 있는 파일이 다르다.
+ *
+ * 예를 들어 q4f16 은 large-v3-turbo 에만 있고 tiny/base/small 에는 없다.
+ * 없는 것을 지정하면 "Could not locate file" 로 실패한다(실제로 겪었다).
+ * Hugging Face 에서 파일 목록을 직접 확인하고 아래 표를 만들었다.
+ *
+ * 이름과 실제 파일의 대응(라이브러리 소스 기준):
+ *   q4 -> _q4.onnx, q8 -> _quantized.onnx, q4f16 -> _q4f16.onnx
+ */
+const DTYPE_BY_MODEL = {
+  "onnx-community/whisper-large-v3-turbo": {
+    // 인코더 370MB + 디코더 193MB = 약 560MB
+    fp16: { encoder_model: "q4f16", decoder_model_merged: "q4f16" },
+    // fp16 을 못 쓰는 기기용. 용량이 커지지만 확실히 존재하는 조합이다.
+    safe: { encoder_model: "q4", decoder_model_merged: "q4" },
+  },
+  default: {
+    // tiny/base/small 공통. small 기준 인코더 66MB + 디코더 157MB = 약 220MB
+    fp16: { encoder_model: "q4", decoder_model_merged: "q8" },
+    safe: { encoder_model: "q4", decoder_model_merged: "q8" },
+  },
+};
+
+/** 어떤 기기에서도 존재가 보장되는 조합(마지막 대비책). */
+const FALLBACK_DTYPE = { encoder_model: "q8", decoder_model_merged: "q8" };
+
+/** WebGPU 가 있어도 fp16 을 못 쓰는 기기가 있다. 실제로 확인한다. */
+async function supportsFp16() {
+  try {
+    const adapter = await navigator.gpu?.requestAdapter();
+    return !!adapter?.features?.has("shader-f16");
+  } catch {
+    return false;
+  }
+}
+
+async function pickDtype(model, device) {
+  const table = DTYPE_BY_MODEL[model] || DTYPE_BY_MODEL.default;
+  if (device === "webgpu" && (await supportsFp16())) return table.fp16;
+  return table.safe;
+}
+
 async function getTranscriber(model, onEvent) {
   await loadLibrary();
   const device = await pickDevice();
@@ -66,26 +109,28 @@ async function getTranscriber(model, onEvent) {
   transcriber = null;
   loadedKey = null;
 
-  // 실제 파일 크기를 보고 고른 조합이다.
-  //  * WebGPU 는 fp16 을 쓸 수 있어 q4f16 이 가장 작고 빠르다
-  //    (large-v3-turbo 기준 인코더 370MB + 디코더 193MB)
-  //  * WebGPU 가 없으면 fp16 을 못 쓰므로 q4/q8 로 내려간다
-  //    (인코더는 q4 가 int8 보다 작고, 디코더는 int8 이 더 작다)
-  const dtype = device === "webgpu"
-    ? { encoder_model: "q4f16", decoder_model_merged: "q4f16" }
-    : { encoder_model: "q4", decoder_model_merged: "q8" };
+  const dtype = await pickDtype(model, device);
 
-  transcriber = await pipelineFn("automatic-speech-recognition", model, {
-    device,
-    dtype,
-    progress_callback: (item) => {
-      if (item.status === "progress" && item.total) {
-        onEvent({ type: "download", file: item.file, loaded: item.loaded, total: item.total });
-      } else if (item.status === "done") {
-        onEvent({ type: "download-done", file: item.file });
-      }
-    },
-  });
+  const progress_callback = (item) => {
+    if (item.status === "progress" && item.total) {
+      onEvent({ type: "download", file: item.file, loaded: item.loaded, total: item.total });
+    } else if (item.status === "done") {
+      onEvent({ type: "download-done", file: item.file });
+    }
+  };
+
+  try {
+    transcriber = await pipelineFn("automatic-speech-recognition", model, {
+      device, dtype, progress_callback,
+    });
+  } catch (error) {
+    // 지정한 파일이 그 모델에 없을 수 있다. 확실한 조합으로 한 번 더 시도한다.
+    if (!/could not locate|not found|404/i.test(String(error?.message || error))) throw error;
+    onEvent({ type: "phase", phase: "retrying" });
+    transcriber = await pipelineFn("automatic-speech-recognition", model, {
+      device, dtype: FALLBACK_DTYPE, progress_callback,
+    });
+  }
   loadedKey = key;
   return { asr: transcriber, device };
 }

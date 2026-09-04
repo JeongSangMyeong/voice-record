@@ -1,0 +1,6 @@
+{
+  "onnx-community/whisper-tiny":  ["encoder_model_q4.onnx","encoder_model_quantized.onnx","encoder_model_int8.onnx","encoder_model_fp16.onnx","decoder_model_merged_q4.onnx","decoder_model_merged_quantized.onnx","decoder_model_merged_int8.onnx","decoder_model_merged_fp16.onnx"],
+  "onnx-community/whisper-base":  ["encoder_model_q4.onnx","encoder_model_quantized.onnx","encoder_model_int8.onnx","encoder_model_fp16.onnx","decoder_model_merged_q4.onnx","decoder_model_merged_quantized.onnx","decoder_model_merged_int8.onnx","decoder_model_merged_fp16.onnx"],
+  "onnx-community/whisper-small": ["encoder_model_q4.onnx","encoder_model_quantized.onnx","encoder_model_int8.onnx","encoder_model_fp16.onnx","decoder_model_merged_q4.onnx","decoder_model_merged_quantized.onnx","decoder_model_merged_int8.onnx","decoder_model_merged_fp16.onnx"],
+  "onnx-community/whisper-large-v3-turbo": ["encoder_model_q4.onnx","encoder_model_q4f16.onnx","encoder_model_quantized.onnx","encoder_model_int8.onnx","encoder_model_fp16.onnx","decoder_model_merged_q4.onnx","decoder_model_merged_q4f16.onnx","decoder_model_merged_quantized.onnx","decoder_model_merged_int8.onnx","decoder_model_merged_fp16.onnx"]
+}

@@ -142,6 +142,64 @@ class TestBrowserOnlyWebApp:
     업로드 코드가 실수로 들어오면 그 약속이 깨지므로 검사한다.
     """
 
+    def test_every_requested_model_file_actually_exists(self):
+        """모델마다 올라와 있는 파일이 다르다.
+
+        q4f16 은 large-v3-turbo 에만 있는데 전부에 적용해서
+        "Could not locate file" 로 실패한 적이 있다.
+        Hugging Face 에서 확인한 실제 파일 목록과 코드를 대조한다.
+        """
+        import json
+        import re
+
+        actual = json.loads(
+            (Path(__file__).parent / "whisper_onnx_files.json").read_text(encoding="utf-8")
+        )
+        engine = (WEB_DIR / "engine.js").read_text(encoding="utf-8")
+        block = re.search(r"const DTYPE_BY_MODEL = \{(.*?)\n\};", engine, re.S)
+        assert block, "DTYPE_BY_MODEL 을 찾지 못했습니다"
+
+        # 라이브러리 소스에서 확인한 이름 -> 파일 접미사 대응
+        suffix = {
+            "fp32": "", "fp16": "_fp16", "int8": "_int8", "uint8": "_uint8",
+            "q8": "_quantized", "q4": "_q4", "q4f16": "_q4f16", "bnb4": "_bnb4",
+        }
+        pairs = re.findall(
+            r'(encoder_model|decoder_model_merged):\s*"(\w+)"', block.group(1)
+        )
+        assert pairs, "정밀도 지정을 찾지 못했습니다"
+
+        used = {name for _, name in pairs}
+        assert used <= set(suffix), f"모르는 정밀도 이름: {used - set(suffix)}"
+
+        # q4f16 을 쓰는 모델은 large-v3-turbo 뿐이어야 한다
+        for model, files in actual.items():
+            for part, name in pairs:
+                filename = f"{part}{suffix[name]}.onnx"
+                if name == "q4f16" and "large-v3-turbo" not in model:
+                    assert filename not in files  # 애초에 없는 게 정상
+                    continue
+
+        # 실제로 코드가 large-v3-turbo 에만 q4f16 을 쓰는지
+        turbo_block = re.search(
+            r'"onnx-community/whisper-large-v3-turbo":\s*\{(.*?)\n  \},', block.group(1), re.S
+        )
+        assert turbo_block and "q4f16" in turbo_block.group(1)
+        default_block = re.search(r"default:\s*\{(.*?)\n  \},", block.group(1), re.S)
+        assert default_block and "q4f16" not in default_block.group(1), (
+            "작은 모델에는 q4f16 파일이 없습니다"
+        )
+
+    def test_retries_with_a_safe_precision_when_a_file_is_missing(self):
+        engine = (WEB_DIR / "engine.js").read_text(encoding="utf-8")
+        assert "FALLBACK_DTYPE" in engine
+        assert "could not locate" in engine.lower()
+
+    def test_checks_fp16_support_not_just_webgpu(self):
+        """WebGPU 가 있어도 fp16(shader-f16) 을 못 쓰는 기기가 있다."""
+        engine = (WEB_DIR / "engine.js").read_text(encoding="utf-8")
+        assert "shader-f16" in engine
+
     def test_user_can_stop_a_running_job(self):
         """멈출 방법이 없으면 휴대폰이 뜨거워져도 탭을 닫는 수밖에 없다."""
         html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
