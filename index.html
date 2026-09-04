@@ -139,6 +139,8 @@ const $ = (id) => document.getElementById(id);
 const SAMPLE_RATE = 16000;
 let picked = null, recorder = null, chunks = [], timer = null, recStart = 0, worker = null;
 let lastResult = null;
+const downloaded = new Map();
+let stallTimer = null;
 
 /* ---------- 보안 연결 확인 (마이크는 https 에서만 된다) ---------- */
 if (!window.isSecureContext) {
@@ -256,17 +258,42 @@ $("go").addEventListener("click", async () => {
   if (audio.length < SAMPLE_RATE * 0.2) return showError("소리가 너무 짧습니다.");
 
   if (!worker) {
-    worker = new Worker(new URL("./worker.js", import.meta.url), { type: "module" });
+    try {
+      worker = new Worker(new URL("./worker.js", import.meta.url), { type: "module" });
+    } catch (e) {
+      return showError("작업자를 만들지 못했습니다: " + (e.message || e));
+    }
     worker.addEventListener("message", onWorker);
-    worker.addEventListener("error", (e) => showError("작업자 오류: " + e.message));
+    // 워커가 죽으면 반드시 버려야 한다. 그대로 두면 다음 시도에서 죽은 워커에
+    // 말을 걸게 되어 '모델 준비 중' 에서 영영 멈춘다.
+    worker.addEventListener("error", (e) => {
+      const detail = e.message || (e.filename ? `${e.filename}:${e.lineno}` : "");
+      killWorker();
+      showError(
+        "받아쓰기 모듈을 불러오지 못했습니다.\n" +
+          "인터넷 연결을 확인하고 다시 눌러 주세요.\n" +
+          (detail ? `(${detail})` : "(자세한 원인이 전달되지 않았습니다)"),
+      );
+    });
+    worker.addEventListener("messageerror", () => {
+      killWorker();
+      showError("작업자와 주고받는 데이터가 손상되었습니다. 다시 시도해 주세요.");
+    });
   }
-  $("statusText").textContent = "모델 준비 중…";
+  $("statusText").textContent = "모델 준비 중… (처음이면 시간이 걸립니다)";
+  // 오래 아무 소식이 없으면 멈춘 게 아닌지 알려 준다.
+  clearTimeout(stallTimer);
+  stallTimer = setTimeout(() => {
+    if (!$("prog").classList.contains("hidden")) {
+      $("statusText").textContent =
+        "아직 모델을 내려받는 중입니다. 데이터가 크니 조금만 더 기다려 주세요…";
+    }
+  }, 20000);
   worker.postMessage({
     audio, model: $("model").value, language: $("lang").value, sampleRate: SAMPLE_RATE,
   });
 });
 
-const downloaded = new Map();
 function onWorker(event) {
   const d = event.data;
   if (d.type === "download") {
@@ -286,8 +313,16 @@ function onWorker(event) {
     $("fill").style.width = "100%";
     showResult(d);
   } else if (d.type === "error") {
+    killWorker();          // 한 번 실패한 워커는 버린다(다음 시도가 멈추지 않도록)
     showError(d.message);
   }
+}
+
+function killWorker() {
+  clearTimeout(stallTimer);
+  if (worker) { try { worker.terminate(); } catch {} }
+  worker = null;
+  downloaded.clear();
 }
 
 function showError(message) {

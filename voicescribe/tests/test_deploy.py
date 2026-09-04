@@ -162,9 +162,30 @@ class TestBrowserOnlyWebApp:
         assert "@huggingface/transformers@" in worker
         assert "@latest" not in worker
 
-    def test_worker_uses_the_browser_build(self):
+    def test_worker_uses_the_browser_bundle_not_the_bundler_build(self):
+        """dist/transformers.web.js 는 번들러용이라 브라우저에서 즉시 죽는다.
+
+        그 파일은 최상위에 `import "onnxruntime-web/webgpu"` 같은 이름 참조를
+        남겨 두는데 브라우저가 이를 풀지 못해, 원인 메시지도 없이
+        "작업자 오류: undefined" 만 뜬다. 실제로 겪었던 문제다.
+        의존성이 모두 합쳐진 dist/transformers.min.js 를 써야 한다.
+        """
         worker = (WEB_DIR / "worker.js").read_text(encoding="utf-8")
-        assert "transformers.web.js" in worker
+        code = "\n".join(
+            line for line in worker.splitlines() if not line.lstrip().startswith("//")
+        )
+        assert "transformers.min.js" in code
+        assert "transformers.web.js" not in code
+
+    def test_worker_has_a_fallback_cdn(self):
+        worker = (WEB_DIR / "worker.js").read_text(encoding="utf-8")
+        assert "jsdelivr" in worker and "unpkg" in worker
+
+    def test_page_discards_a_dead_worker(self):
+        """죽은 워커를 재사용하면 두 번째 시도가 '모델 준비 중' 에서 멈춘다."""
+        html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+        assert "killWorker" in html
+        assert "terminate()" in html
 
     def test_handles_audio_longer_than_thirty_seconds(self):
         """Whisper 는 한 번에 30초만 본다. 잘라서 처리하도록 설정해야 한다."""

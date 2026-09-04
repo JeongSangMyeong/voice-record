@@ -5,16 +5,49 @@
  * 모델 실행은 전부 여기서 한다.
  */
 
-import {
-  pipeline,
-  env,
-} from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.2.0/dist/transformers.web.js";
+// 주의: dist/transformers.web.js 를 쓰면 안 된다.
+// 그 파일은 번들러용이라 최상위에 `import "onnxruntime-web/webgpu"` 같은
+// 이름 참조가 남아 있고, 브라우저는 그 이름을 풀 수 없어 워커가 그대로 죽는다
+// (원인 메시지도 없이 "작업자 오류: undefined" 로만 보인다).
+// 브라우저에서 바로 쓸 수 있는 건 모든 의존성이 합쳐진 dist/transformers.min.js 다.
+// 한 곳이 막혀 있을 수 있으니 대체 주소를 순서대로 시도한다.
+const LIB_URLS = [
+  "https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.2.0/dist/transformers.min.js",
+  "https://unpkg.com/@huggingface/transformers@4.2.0/dist/transformers.min.js",
+];
 
-// 원격 모델만 쓴다(이 사이트에는 모델 파일을 두지 않는다).
-env.allowLocalModels = false;
-
+let pipeline = null;
 let transcriber = null;
 let loadedKey = null;
+
+/** 라이브러리를 불러온다. 실패하면 원인을 알 수 있는 메시지로 바꿔 던진다. */
+async function loadLibrary() {
+  if (pipeline) return;
+
+  let lib = null;
+  let lastError = null;
+  for (const url of LIB_URLS) {
+    try {
+      lib = await import(url);
+      break;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  if (!lib) {
+    throw new Error(
+      "음성인식 라이브러리를 불러오지 못했습니다.\n" +
+        "인터넷 연결을 확인해 주세요.\n" +
+        "사내망이라면 cdn.jsdelivr.net 과 unpkg.com 이 막혀 있을 수 있습니다.\n" +
+        `(${lastError?.message || lastError})`,
+    );
+  }
+  if (typeof lib.pipeline !== "function") {
+    throw new Error("라이브러리 형식이 예상과 다릅니다. 잠시 후 다시 시도해 주세요.");
+  }
+  pipeline = lib.pipeline;
+  lib.env.allowLocalModels = false;   // 원격 모델만 쓴다
+}
 
 /** 이 기기에서 WebGPU 를 쓸 수 있는지 확인한다. 되면 훨씬 빠르다. */
 async function pickDevice() {
@@ -28,6 +61,7 @@ async function pickDevice() {
 }
 
 async function getTranscriber(model) {
+  await loadLibrary();
   const device = await pickDevice();
   const key = `${model}|${device}`;
   if (transcriber && loadedKey === key) return { transcriber, device };
