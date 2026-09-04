@@ -324,12 +324,14 @@ class TestBrowserOnlyWebApp:
         타임스탬프도 전부 00:00 으로 나온다.
         """
         engine = (WEB_DIR / "engine.js").read_text(encoding="utf-8")
-        after = engine[engine.index("const result = { text, chunks: collected }") :]
+        after = engine[engine.index("async function runWhisper") :]
         # 왜 그랬는지 적어 둔 주석은 검사에서 뺀다
         after = "\n".join(
             line for line in after.splitlines() if not line.lstrip().startswith("//")
         )
-        assert "c.timestamp" not in after, (
+        # 창을 자를 때 한 번 푸는 것은 정상이다. 그 뒤에 또 풀면 시각이 0 이 된다.
+        tail = after[after.index("return {") :]
+        assert "c.timestamp" not in tail, (
             "구간을 만든 뒤에 c.timestamp 를 또 읽고 있습니다. 시각이 0 이 됩니다."
         )
 
@@ -528,6 +530,112 @@ class TestBrowserOnlyWebApp:
         assert "들리지 않는 소리" in html, "소리를 재생한다는 사실을 알리지 않습니다"
         assert "아이폰" in html, "아이폰에서는 안 된다는 안내가 없습니다"
 
+    def test_sensevoice_features_match_the_reference(self):
+        """소리에서 특징을 뽑는 계산이 조금만 틀어져도 인식이 통째로 망가진다.
+
+        파이썬 기준 구현으로 미리 계산해 둔 값과 자바스크립트 결과를 대조한다.
+        (기준 구현 자체는 sherpa-onnx 의 출력과 4개 언어에서 일치하는 것을 확인했다)
+        """
+        node = shutil.which("node")
+        if not node:
+            pytest.skip("node 가 없어 건너뜁니다")
+
+        reference = Path(__file__).parent / "sensevoice_reference.json"
+        script = f"""
+        import fs from "node:fs";
+        const m = await import("{(WEB_DIR / 'sensevoice.js').as_posix()}");
+        const gold = JSON.parse(fs.readFileSync("{reference.as_posix()}", "utf8"));
+        const meta = m.parseMeta(JSON.parse(
+          fs.readFileSync("{(WEB_DIR / 'sensevoice-meta.json').as_posix()}", "utf8")));
+        const audio = Float32Array.from(gold["소리표본"]);
+        const mel = m.computeFbank(audio, 16000);
+        const lfr = m.applyLfr(mel, meta.lfrWindowSize, meta.lfrWindowShift);
+        m.applyCmvn(lfr, meta.negMean, meta.invStddev);
+        const diff = (a, b) => Math.max(...a.map((x, i) => Math.abs(x - b[i])));
+        console.log(JSON.stringify({{
+          melFrames: mel.length,
+          melDim: mel[0]?.length,
+          lfrFrames: lfr.length,
+          lfrDim: lfr[0]?.length,
+          firstMelDiff: diff([...mel[0]], gold["멜첫줄"]),
+          normHeadDiff: diff([...lfr[0]].slice(0, 20), gold["정규화첫줄앞20"]),
+        }}));
+        """
+        result = subprocess.run(
+            [node, "--input-type=module", "-e", script],
+            capture_output=True, text=True, timeout=120,
+        )
+        assert result.returncode == 0, result.stderr
+        r = json.loads(result.stdout.strip().splitlines()[-1])
+        gold = json.loads(reference.read_text(encoding="utf-8"))
+        # 표본을 잘라 넣었으므로 프레임 수는 잘린 길이에 맞게 나온다
+        assert r["melDim"] == 80 and r["lfrDim"] == 560
+        assert r["melFrames"] > 0 and r["lfrFrames"] > 0
+        assert r["firstMelDiff"] < 1e-3, f"멜 특징이 어긋납니다: {r['firstMelDiff']}"
+        assert r["normHeadDiff"] < 1e-2, f"정규화 결과가 어긋납니다: {r['normHeadDiff']}"
+
+    def test_sensevoice_preprocessing_rules_are_complete(self):
+        """브라우저는 ONNX 안의 규칙을 못 읽어서 따로 빼 두었다. 빠지면 인식이 안 된다."""
+        import json as _json
+
+        meta = _json.loads((WEB_DIR / "sensevoice-meta.json").read_text(encoding="utf-8"))
+        assert len(meta["neg_mean"]) == 560
+        assert len(meta["inv_stddev"]) == 560
+        assert meta["lfr_window_size"] == "7" and meta["lfr_window_shift"] == "6"
+        for code in ("lang_auto", "lang_ko", "lang_en", "lang_ja", "lang_zh", "lang_yue"):
+            assert code in meta, f"언어 코드가 빠졌습니다: {code}"
+        # sherpa-onnx 2024-07-17 판. 신판(2025-09-09)은 한국어가 깨진다.
+        assert meta["크기"] == 239233841, "확인한 것과 다른 모델을 가리키고 있습니다"
+
+    def test_sensevoice_ctc_decoding(self):
+        """같은 글자가 이어지면 하나로 합치고 빈칸은 버려야 한다."""
+        node = shutil.which("node")
+        if not node:
+            pytest.skip("node 가 없어 건너뜁니다")
+        script = f"""
+        const m = await import("{(WEB_DIR / 'sensevoice.js').as_posix()}");
+        const tokens = ["<blank>", "▁안녕", "하", "세", "요", "<|ko|>"];
+        // 프레임마다 고를 번호: 빈칸(0)과 반복을 섞어 둔다
+        const ids = [0, 5, 1, 1, 0, 2, 2, 2, 3, 0, 4, 4];
+        const vocab = tokens.length;
+        const logits = new Float32Array(ids.length * vocab);
+        ids.forEach((id, t) => (logits[t * vocab + id] = 10));
+        const pieces = m.ctcGreedy(logits, ids.length, vocab, tokens);
+        console.log(JSON.stringify({{ pieces, text: m.detokenize(pieces),
+          tokens: m.parseTokens("<blank> 0\\n▁안녕 1\\n하 2\\n") }}));
+        """
+        result = subprocess.run(
+            [node, "--input-type=module", "-e", script],
+            capture_output=True, text=True, timeout=60,
+        )
+        assert result.returncode == 0, result.stderr
+        r = json.loads(result.stdout.strip().splitlines()[-1])
+        assert r["text"] == "안녕하세요", f"해독 결과가 다릅니다: {r['text']!r}"
+        assert r["tokens"] == ["<blank>", "▁안녕", "하"], r["tokens"]
+
+    def test_sensevoice_windows_are_short_enough_for_speakers(self):
+        """SenseVoice 는 글자별 시각을 주지 않는다.
+
+        구간을 길게 잡으면 그 구간 전체가 한 화자로 뭉쳐 버린다.
+        """
+        engine = (WEB_DIR / "engine.js").read_text(encoding="utf-8")
+        match = re.search(r"SENSEVOICE_WINDOW_SECONDS = (\d+)", engine)
+        assert match, "SenseVoice 용 구간 길이를 찾지 못했습니다"
+        assert int(match.group(1)) <= 15, "구간이 길어 화자 구분이 뭉개집니다"
+        assert "splitIntoWindows(audio, sampleRate, SENSEVOICE_WINDOW_SECONDS)" in engine
+
+    def test_diarization_works_with_sensevoice_too(self):
+        """SenseVoice 경로에서는 화자 구분용 라이브러리를 아직 안 불러온 상태다.
+
+        그대로 두면 화자 구분이 항상 실패한다(실제로 그랬다).
+        """
+        engine = (WEB_DIR / "engine.js").read_text(encoding="utf-8")
+        spot = engine.index('const { assignSpeakers } = await import("./diarize.js")')
+        before = engine[max(0, spot - 400) : spot]
+        assert "if (!libRef) await loadLibrary();" in before, (
+            "SenseVoice 로 받아쓰면 화자 구분이 실패합니다"
+        )
+
     def test_web_files_at_the_root_match_the_deploy_copy(self):
         """뿌리의 파일이 실제로 배포되는 파일이다. 테스트는 배포본만 본다.
 
@@ -535,7 +643,8 @@ class TestBrowserOnlyWebApp:
         """
         root = WEB_DIR.parent.parent.parent
         for name in ("index.html", "engine.js", "diarize.js", "worker.js",
-                     "coi-serviceworker.js", "manifest.json",
+                     "coi-serviceworker.js", "manifest.json", "sensevoice.js",
+                     "sensevoice-meta.json",
                      "icon-192.png", "icon-512.png", "apple-touch-icon.png"):
             here, there = root / name, WEB_DIR / name
             if not here.exists():
@@ -695,15 +804,32 @@ class TestBrowserOnlyWebApp:
         assert "export async function runTranscription" in engine
 
     def test_never_uploads_audio(self):
-        """서버로 오디오를 보내는 코드가 없어야 한다."""
-        html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
-        worker = (WEB_DIR / "worker.js").read_text(encoding="utf-8")
-        engine = (WEB_DIR / "engine.js").read_text(encoding="utf-8")
-        for name, text in (("index.html", html), ("worker.js", worker), ("engine.js", engine)):
-            assert "FormData" not in text, f"{name} 에 업로드 코드가 있습니다"
-            assert "XMLHttpRequest" not in text, f"{name} 에 업로드 코드가 있습니다"
-            # fetch 는 모델을 받을 때만 쓰이므로, 직접 호출이 없어야 한다.
-            assert "fetch(" not in text, f"{name} 에 직접 fetch 호출이 있습니다"
+        """녹음이 기기 밖으로 나가지 않아야 한다. 이 약속이 이 도구의 존재 이유다.
+
+        모델을 내려받으려면 fetch 가 필요하므로 무조건 금지할 수는 없다.
+        대신 모든 요청이 (1) 알려진 모델 주소이고 (2) 보내는 내용이 없는지 본다.
+        """
+        files = ["index.html", "worker.js", "engine.js", "sensevoice.js", "diarize.js"]
+        allowed = ("huggingface.co", "cdn.jsdelivr.net", "unpkg.com", "./", "`${")
+        for name in files:
+            path = WEB_DIR / name
+            if not path.exists():
+                continue
+            text = path.read_text(encoding="utf-8")
+            for banned in ("FormData", "XMLHttpRequest", "sendBeacon", "WebSocket", "RTCPeer"):
+                assert banned not in text, f"{name} 에 밖으로 보내는 코드가 있습니다: {banned}"
+
+            for match in re.finditer(r"fetch\(", text):
+                call = text[match.end() : match.end() + 220]
+                assert not re.search(r"\bbody\s*:", call), (
+                    f"{name} 의 fetch 가 무언가를 보내고 있습니다: {call[:90]}"
+                )
+                assert not re.search(r"method\s*:\s*[\"']()(?!GET)", call), (
+                    f"{name} 의 fetch 가 GET 이 아닙니다: {call[:90]}"
+                )
+                assert any(token in call for token in allowed), (
+                    f"{name} 에 알 수 없는 곳으로 가는 fetch 가 있습니다: {call[:90]}"
+                )
 
     def test_worker_pins_an_exact_library_version(self):
         """CDN 버전을 고정하지 않으면 어느 날 갑자기 깨질 수 있다."""
