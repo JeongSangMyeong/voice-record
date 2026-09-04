@@ -100,16 +100,20 @@
         </select>
       </div>
       <div>
-        <label class="f" for="model">정확도</label>
+        <label class="f" for="model">받아쓰기 엔진</label>
         <select id="model">
-          <option value="sensevoice-small" selected>한국어·중국어·일본어·영어 (권장 · 가장 빠름)</option>
-          <option value="onnx-community/whisper-large-v3-turbo">그 밖의 언어 — 가장 정확</option>
-          <option value="onnx-community/whisper-small">그 밖의 언어 — 보통</option>
-          <option value="onnx-community/whisper-base">그 밖의 언어 — 낮음</option>
-          <option value="onnx-community/whisper-tiny">그 밖의 언어 — 아주 낮음</option>
+          <optgroup label="한국어 · 일본어 · 중국어 · 영어">
+            <option value="sensevoice-small" selected>✅ SenseVoice — 권장 (가장 정확하고 빠름)</option>
+          </optgroup>
+          <optgroup label="그 밖의 언어 (프랑스어·독일어·베트남어 등)">
+            <option value="onnx-community/whisper-large-v3-turbo">Whisper 큼 — 정확하지만 느림</option>
+            <option value="onnx-community/whisper-small">Whisper 보통</option>
+            <option value="onnx-community/whisper-base">Whisper 작음 — 빠름</option>
+            <option value="onnx-community/whisper-tiny">Whisper 아주 작음 — 가장 빠름</option>
+          </optgroup>
         </select>
         <div class="status" style="margin-top:6px">
-          한국어는 <b>가장 정확</b>을 권합니다. 처음 한 번만 받고 이후엔 저장됩니다.
+          한국어면 <b>맨 위 SenseVoice</b> 그대로 두세요. 처음 한 번만 받고 이후엔 저장됩니다.
         </div>
       </div>
     </div>
@@ -180,7 +184,7 @@ let cancelled = false;
 let workerFailed = false;      // 작업자가 한 번 실패하면 이후에는 바로 우회한다
 let mainThreadBusy = false;
 // 파일을 고칠 때마다 올린다. 브라우저가 예전 파일을 쓰지 않게 하는 용도.
-const APP_VERSION = "22";
+const APP_VERSION = "23";
 
 /* ---------- 보안 연결 확인 (마이크는 https 에서만 된다) ---------- */
 if (!window.isSecureContext) {

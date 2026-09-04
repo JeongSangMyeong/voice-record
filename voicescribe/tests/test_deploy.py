@@ -636,6 +636,22 @@ class TestBrowserOnlyWebApp:
             "SenseVoice 로 받아쓰면 화자 구분이 실패합니다"
         )
 
+    def test_engine_choice_is_understandable(self):
+        """어느 것이 무슨 엔진인지 화면만 보고 알 수 있어야 한다.
+
+        예전에는 칸 이름이 '정확도' 였고 그 밑에 '한국어는 가장 정확을 권합니다'
+        라는 옛 안내가 남아 있어서, 기본값과 정반대로 안내하고 있었다.
+        사용자가 '뭐가 SenseVoice 냐' 고 물어본 이유다.
+        """
+        html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+        select = html[html.index('<select id="model">') : html.index("</select>", html.index('<select id="model">'))]
+        assert "SenseVoice" in select, "엔진 이름이 화면에 없습니다"
+        assert "Whisper" in select, "엔진 이름이 화면에 없습니다"
+        assert "optgroup" in select, "어느 것이 어느 언어용인지 묶여 있지 않습니다"
+        assert 'value="sensevoice-small" selected' in select, "권장 엔진이 기본값이 아닙니다"
+        # 기본값과 어긋나는 옛 안내가 남아 있으면 안 된다
+        assert "한국어는 <b>가장 정확</b>을 권합니다" not in html, "옛 안내가 남아 있습니다"
+
     def test_web_files_at_the_root_match_the_deploy_copy(self):
         """뿌리의 파일이 실제로 배포되는 파일이다. 테스트는 배포본만 본다.
 
