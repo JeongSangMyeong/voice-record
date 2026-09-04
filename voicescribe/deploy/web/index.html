@@ -113,7 +113,7 @@
       </div>
     </div>
     <label class="chip-row" style="display:flex;align-items:center;gap:8px;margin-top:14px;font-size:15px;cursor:pointer">
-      <input type="checkbox" id="diarize" style="width:20px;height:20px" />
+      <input type="checkbox" id="diarize" checked style="width:20px;height:20px" />
       화자 구분하기 (누가 말했는지 나눠서 표시)
     </label>
     <button id="go" class="primary" style="margin-top:14px" disabled>받아쓰기 시작</button>
@@ -148,11 +148,14 @@ const SAMPLE_RATE = 16000;
 let picked = null, recorder = null, chunks = [], timer = null, recStart = 0, worker = null;
 let lastResult = null;
 const downloaded = new Map();
+const downloadBytes = new Map();
 let stallTimer = null;
+let currentPhase = "";
+let onMainThread = false;
 let workerFailed = false;      // 작업자가 한 번 실패하면 이후에는 바로 우회한다
 let mainThreadBusy = false;
 // 파일을 고칠 때마다 올린다. 브라우저가 예전 파일을 쓰지 않게 하는 용도.
-const APP_VERSION = "5";
+const APP_VERSION = "7";
 
 /* ---------- 보안 연결 확인 (마이크는 https 에서만 된다) ---------- */
 if (!window.isSecureContext) {
@@ -253,15 +256,42 @@ async function toMono16k(file) {
 }
 
 /* ---------- 실행 ---------- */
-$("model").addEventListener("change", () => {
+/** 이 기기가 빠른 모드(WebGPU)를 쓸 수 있는지 미리 확인해 안내한다. */
+let hasWebGPU = null;
+async function checkDevice() {
+  try {
+    hasWebGPU = "gpu" in navigator && !!(await navigator.gpu.requestAdapter());
+  } catch {
+    hasWebGPU = false;
+  }
+  updateModelHint();
+}
+
+function updateModelHint() {
   const big = $("model").value.includes("large");
-  $("firstRun").innerHTML = big
+  const box = $("firstRun");
+  box.classList.remove("hidden");
+
+  if (big && hasWebGPU === false) {
+    box.className = "note warn";
+    box.innerHTML =
+      "이 기기는 <b>빠른 모드(WebGPU)를 지원하지 않습니다.</b> " +
+      "가장 정확한 모델은 매우 느리고 휴대폰이 뜨거워질 수 있습니다.<br />" +
+      "<b>보통(약 220MB)</b> 을 권합니다. 그래도 쓰시려면 짧은 녹음으로 먼저 시험해 보세요.";
+    return;
+  }
+  box.className = "note info";
+  box.innerHTML = big
     ? "가장 정확한 모델은 <b>약 560MB</b> 를 내려받습니다. " +
       "<b>와이파이</b>에서, 받는 동안 <b>이 화면을 그대로 두세요.</b> " +
-      "다른 앱으로 나가면 중단됩니다. (한 번 받으면 다음부터는 바로 열립니다)"
-    : "처음 한 번만 음성인식 모델을 내려받습니다. 그 뒤로는 저장되어 빠르게 열립니다.";
-  $("firstRun").classList.remove("hidden");
-});
+      "다른 앱으로 나가면 중단됩니다." +
+      (hasWebGPU ? " (이 기기는 빠른 모드를 지원합니다 ✓)" : "")
+    : "처음 한 번만 음성인식 모델을 내려받습니다. 그 뒤로는 저장되어 빠르게 열립니다." +
+      (hasWebGPU ? " 이 기기는 빠른 모드를 지원합니다 ✓" : "");
+}
+
+$("model").addEventListener("change", updateModelHint);
+checkDevice();
 
 $("go").addEventListener("click", async () => {
   if (!picked) return;
@@ -288,6 +318,8 @@ $("go").addEventListener("click", async () => {
   };
 
   leftDuringWork = false;
+  currentPhase = "";
+  downloadBytes.clear();
   keepAwake();
   const big = $("model").value.includes("large");
   $("statusText").textContent = big
@@ -355,15 +387,24 @@ function friendlyError(message) {
   return raw;
 }
 
-/** 진행 소식이 한동안 없을 때 "멈춘 게 아니다" 라고 알려 준다. */
+/**
+ * 오래 조용할 때 "멈춘 게 아니다" 라고 알려 준다.
+ *
+ * 예전에는 20초가 지나면 무조건 "모델을 내려받는 중" 이라고 띄웠는데,
+ * 이미 다 받고 받아쓰는 중일 때도 그렇게 나와 사실과 달랐다.
+ * 지금 단계에 맞는 문구만 쓴다.
+ */
 function armStallNotice() {
   clearTimeout(stallTimer);
   stallTimer = setTimeout(() => {
-    if (!$("prog").classList.contains("hidden")) {
-      $("statusText").textContent =
-        "아직 모델을 내려받는 중입니다. 데이터가 크니 조금만 더 기다려 주세요…";
-    }
-  }, 20000);
+    if ($("prog").classList.contains("hidden")) return;
+    const hint = {
+      loading: "모델을 준비하는 중입니다. 이 화면을 그대로 두세요…",
+      transcribing: "받아쓰는 중입니다. 녹음이 길면 시간이 걸립니다…",
+      diarizing: "화자를 구분하는 중입니다…",
+    }[currentPhase];
+    if (hint) $("statusText").textContent = hint;
+  }, 25000);
 }
 
 /** 작업자로 시작한다. 만들지 못하면 false. */
@@ -400,6 +441,7 @@ function startWithWorker(request) {
 async function runOnMainThread(request) {
   if (mainThreadBusy) return;
   mainThreadBusy = true;
+  onMainThread = true;
   try {
     const { runTranscription } = await import(`./engine.js?v=${APP_VERSION}`);
     const result = await runTranscription(request, (e) => onWorker({ data: e }));
@@ -414,18 +456,38 @@ async function runOnMainThread(request) {
 function onWorker(event) {
   const d = event.data;
   if (d.type === "download") {
-    downloaded.set(d.file, d.loaded / d.total);
-    const values = [...downloaded.values()];
-    const ratio = values.reduce((a,b)=>a+b,0) / values.length;
+    // 파일마다 크기가 다르므로 받은 바이트 합계로 계산해야 정확하다.
+    downloadBytes.set(d.file, { loaded: d.loaded, total: d.total });
+    let loaded = 0, total = 0;
+    for (const v of downloadBytes.values()) { loaded += v.loaded; total += v.total; }
+    const ratio = total > 0 ? loaded / total : 0;
     $("fill").style.width = `${5 + ratio * 45}%`;
-    $("statusText").textContent = `음성인식 모델 내려받는 중… ${Math.round(ratio*100)}%`;
+    const mb = (n) => (n / 1048576).toFixed(0);
+    $("statusText").textContent =
+      `모델 내려받는 중… ${Math.round(ratio * 100)}%  (${mb(loaded)} / ${mb(total)} MB)`;
     $("firstRun").classList.add("hidden");
+    armStallNotice();
   } else if (d.type === "device") {
     $("statusText").textContent = d.device === "webgpu"
       ? "빠른 모드(WebGPU)로 처리합니다" : "처리 중… (이 기기에서는 시간이 조금 걸립니다)";
-  } else if (d.type === "status") {
-    if (d.text === "받아쓰는 중") $("fill").style.width = "60%";
-    $("statusText").textContent = d.text + "…";
+  } else if (d.type === "download-done") {
+    downloaded.set(d.file, 1);
+  } else if (d.type === "phase") {
+    currentPhase = d.phase;
+    if (d.phase === "loading") {
+      $("statusText").textContent = "모델 준비 중…";
+    } else if (d.phase === "transcribing") {
+      $("fill").style.width = "55%";
+      $("statusText").textContent = onMainThread
+        ? "받아쓰는 중… (이 기기에서는 화면이 잠시 멈출 수 있습니다)"
+        : "받아쓰는 중…";
+    } else if (d.phase === "diarizing") {
+      $("fill").style.width = "90%";
+      $("statusText").textContent = "화자를 구분하는 중…";
+    } else if (d.phase === "diarize-skipped") {
+      $("statusText").textContent = "화자 구분은 건너뜁니다";
+    }
+    armStallNotice();
   } else if (d.type === "done") {
     $("fill").style.width = "100%";
     showResult(d);
@@ -480,7 +542,8 @@ function showResult(d) {
     `처리 <b>${d.elapsed.toFixed(0)}초</b>` +
     `속도 <b>x${speed}</b>` +
     (d.speakers > 1 ? `화자 <b>${d.speakers}명</b>` : "") +
-    `모드 <b>${d.device === "webgpu" ? "WebGPU (빠름)" : "일반 (느림)"}</b>`;
+    `모드 <b>${d.device === "webgpu" ? "WebGPU (빠름)" : "일반 (느림)"}</b>` +
+    (onMainThread ? `<span style="color:var(--warn)">화면에서 직접 처리(느림)</span>` : "");
   $("result").classList.remove("hidden");
   $("result").scrollIntoView({ behavior: "smooth", block: "nearest" });
 }

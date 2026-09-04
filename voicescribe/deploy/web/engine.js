@@ -81,6 +81,8 @@ async function getTranscriber(model, onEvent) {
     progress_callback: (item) => {
       if (item.status === "progress" && item.total) {
         onEvent({ type: "download", file: item.file, loaded: item.loaded, total: item.total });
+      } else if (item.status === "done") {
+        onEvent({ type: "download-done", file: item.file });
       }
     },
   });
@@ -97,11 +99,11 @@ async function getTranscriber(model, onEvent) {
 export async function runTranscription(request, onEvent) {
   const { audio, model, language, sampleRate } = request;
 
-  onEvent({ type: "status", text: "모델 준비 중" });
+  onEvent({ type: "phase", phase: "loading" });
   const { asr, device } = await getTranscriber(model, onEvent);
   onEvent({ type: "device", device });
 
-  onEvent({ type: "status", text: "받아쓰는 중" });
+  onEvent({ type: "phase", phase: "transcribing" });
   const started = (globalThis.performance || Date).now();
   const result = await asr(audio, {
     language: language === "auto" ? null : language,
@@ -123,7 +125,7 @@ export async function runTranscription(request, onEvent) {
 
   let speakers = 0;
   if (request.diarize && chunks.length > 1) {
-    onEvent({ type: "status", text: "화자 구분 중" });
+    onEvent({ type: "phase", phase: "diarizing" });
     try {
       const { assignSpeakers } = await import("./diarize.js");
       const labels = assignSpeakers(audio, chunks, sampleRate);
@@ -131,7 +133,7 @@ export async function runTranscription(request, onEvent) {
       speakers = new Set(labels).size;
     } catch (error) {
       // 화자 구분은 부가 기능이다. 실패해도 받아쓰기 결과는 그대로 준다.
-      onEvent({ type: "status", text: "화자 구분을 건너뜁니다" });
+      onEvent({ type: "phase", phase: "diarize-skipped" });
     }
   }
 

@@ -42,20 +42,56 @@ function melFilterbank(nFilters, nFft, sampleRate) {
   return bank;
 }
 
-/** 실수 입력에 대한 이산 푸리에 변환(크기의 제곱). 창 길이가 짧아 단순 구현으로 충분하다. */
+/**
+ * 고속 푸리에 변환(FFT). 크기가 2의 거듭제곱일 때 쓰는 표준 방식이다.
+ *
+ * 처음에는 정의대로 계산했는데(모든 주파수 × 모든 표본), 휴대폰에서 화면이
+ * 눈에 띄게 버벅였다. 같은 결과를 훨씬 적은 연산으로 얻도록 바꿨다.
+ * 512점 기준 약 13만 번 → 약 4600 번으로 줄어든다.
+ */
+function fftInPlace(re, im) {
+  const n = re.length;
+  // 비트 반전 순서로 재배치
+  for (let i = 1, j = 0; i < n; i++) {
+    let bit = n >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) {
+      [re[i], re[j]] = [re[j], re[i]];
+      [im[i], im[j]] = [im[j], im[i]];
+    }
+  }
+  for (let len = 2; len <= n; len <<= 1) {
+    const angle = (-2 * Math.PI) / len;
+    const wRe = Math.cos(angle);
+    const wIm = Math.sin(angle);
+    for (let i = 0; i < n; i += len) {
+      let curRe = 1, curIm = 0;
+      for (let k = 0; k < len / 2; k++) {
+        const uRe = re[i + k], uIm = im[i + k];
+        const vRe = re[i + k + len / 2] * curRe - im[i + k + len / 2] * curIm;
+        const vIm = re[i + k + len / 2] * curIm + im[i + k + len / 2] * curRe;
+        re[i + k] = uRe + vRe;
+        im[i + k] = uIm + vIm;
+        re[i + k + len / 2] = uRe - vRe;
+        im[i + k + len / 2] = uIm - vIm;
+        const nextRe = curRe * wRe - curIm * wIm;
+        curIm = curRe * wIm + curIm * wRe;
+        curRe = nextRe;
+      }
+    }
+  }
+}
+
+/** 주파수별 세기(크기의 제곱)를 구한다. */
 function powerSpectrum(frame, nFft) {
+  const re = new Float64Array(nFft);
+  const im = new Float64Array(nFft);
+  re.set(frame);                       // 나머지는 0 으로 채워진다
+  fftInPlace(re, im);
   const half = (nFft >> 1) + 1;
   const out = new Float32Array(half);
-  for (let k = 0; k < half; k++) {
-    let re = 0, im = 0;
-    const step = (-2 * Math.PI * k) / nFft;
-    for (let n = 0; n < frame.length; n++) {
-      const angle = step * n;
-      re += frame[n] * Math.cos(angle);
-      im += frame[n] * Math.sin(angle);
-    }
-    out[k] = (re * re + im * im) / nFft;
-  }
+  for (let k = 0; k < half; k++) out[k] = (re[k] * re[k] + im[k] * im[k]) / nFft;
   return out;
 }
 

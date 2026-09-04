@@ -142,6 +142,29 @@ class TestBrowserOnlyWebApp:
     업로드 코드가 실수로 들어오면 그 약속이 깨지므로 검사한다.
     """
 
+    def test_diarization_uses_a_fast_transform(self):
+        """정의대로 계산하면(DFT) 휴대폰이 눈에 띄게 버벅인다. FFT 여야 한다."""
+        diarize = (WEB_DIR / "diarize.js").read_text(encoding="utf-8")
+        assert "fftInPlace" in diarize
+
+    def test_diarization_is_on_by_default(self):
+        html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+        assert 'id="diarize" checked' in html
+
+    def test_progress_message_matches_the_real_phase(self):
+        """예전에는 이미 다 받은 뒤에도 '모델을 내려받는 중' 이라고 표시했다."""
+        html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+        engine = (WEB_DIR / "engine.js").read_text(encoding="utf-8")
+        assert "currentPhase" in html
+        assert 'type: "phase"' in engine
+        # 단계와 무관하게 다운로드 중이라고 단정하는 문구가 없어야 한다
+        assert "아직 모델을 내려받는 중입니다" not in html
+
+    def test_warns_when_the_device_cannot_run_the_big_model_well(self):
+        html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+        assert "requestAdapter" in html
+        assert "뜨거워질 수 있습니다" in html
+
     def test_keeps_the_screen_awake_while_working(self):
         """휴대폰은 화면이 꺼지면 다운로드를 멈춘다. 560MB 를 받는 중이면 치명적이다."""
         html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
