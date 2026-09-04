@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -171,53 +172,88 @@ class TestBrowserOnlyWebApp:
                 assert "toWindows" in line, f"toWindows 를 거치지 않는 반환: {line.strip()}"
 
     def test_every_requested_model_file_actually_exists(self):
-        """모델마다 올라와 있는 파일이 다르다.
+        """모델·기기별로 실제 존재하는 파일만 요청하는지, 용량 안내가 맞는지 본다.
 
         q4f16 은 large-v3-turbo 에만 있는데 전부에 적용해서
         "Could not locate file" 로 실패한 적이 있다.
-        Hugging Face 에서 확인한 실제 파일 목록과 코드를 대조한다.
+        또 화면에 안내하는 용량이 실제와 다르면 사용자가 데이터를 예상보다
+        많이 쓰게 되므로, 표에 적은 sizeMB 도 실제 파일 크기와 대조한다.
         """
         import json
-        import re
 
         actual = json.loads(
             (Path(__file__).parent / "whisper_onnx_files.json").read_text(encoding="utf-8")
         )
         engine = (WEB_DIR / "engine.js").read_text(encoding="utf-8")
-        block = re.search(r"const DTYPE_BY_MODEL = \{(.*?)\n\};", engine, re.S)
-        assert block, "DTYPE_BY_MODEL 을 찾지 못했습니다"
+        block = re.search(r"export const MODEL_PROFILES = \{(.*?)\n\};", engine, re.S)
+        assert block, "MODEL_PROFILES 를 찾지 못했습니다"
 
         # 라이브러리 소스에서 확인한 이름 -> 파일 접미사 대응
         suffix = {
             "fp32": "", "fp16": "_fp16", "int8": "_int8", "uint8": "_uint8",
             "q8": "_quantized", "q4": "_q4", "q4f16": "_q4f16", "bnb4": "_bnb4",
         }
-        pairs = re.findall(
-            r'(encoder_model|decoder_model_merged):\s*"(\w+)"', block.group(1)
+
+        entries = re.findall(
+            r'(?:"([^"]+)":\s*\{)|'
+            r'(\w+):\s*\{\s*dtype:\s*\{\s*encoder_model:\s*"(\w+)",\s*'
+            r'decoder_model_merged:\s*"(\w+)"\s*\},\s*sizeMB:\s*(\d+)',
+            block.group(1),
         )
-        assert pairs, "정밀도 지정을 찾지 못했습니다"
-
-        used = {name for _, name in pairs}
-        assert used <= set(suffix), f"모르는 정밀도 이름: {used - set(suffix)}"
-
-        # q4f16 을 쓰는 모델은 large-v3-turbo 뿐이어야 한다
-        for model, files in actual.items():
-            for part, name in pairs:
+        model = None
+        checked = 0
+        for model_name, profile, enc, dec, size_mb in entries:
+            if model_name:
+                model = model_name
+                assert model in actual, f"파일 목록에 없는 모델: {model}"
+                continue
+            assert model, "모델 이름보다 먼저 나온 항목이 있습니다"
+            assert {enc, dec} <= set(suffix), f"모르는 정밀도 이름: {enc}, {dec}"
+            files = actual[model]
+            total = 0
+            for part, name in (("encoder_model", enc), ("decoder_model_merged", dec)):
                 filename = f"{part}{suffix[name]}.onnx"
-                if name == "q4f16" and "large-v3-turbo" not in model:
-                    assert filename not in files  # 애초에 없는 게 정상
-                    continue
+                assert filename in files, (
+                    f"{model} 에 없는 파일을 요청합니다: {filename} ({profile} 칸)"
+                )
+                total += files[filename]
+            expected = round(total / 1048576)
+            assert int(size_mb) == expected, (
+                f"{model} {profile}: 안내 용량 {size_mb}MB, 실제 {expected}MB"
+            )
+            checked += 1
+        assert checked == 12, f"검사한 조합이 {checked}개뿐입니다(모델 4 x 칸 3 이어야 함)"
 
-        # 실제로 코드가 large-v3-turbo 에만 q4f16 을 쓰는지
-        turbo_block = re.search(
-            r'"onnx-community/whisper-large-v3-turbo":\s*\{(.*?)\n  \},', block.group(1), re.S
-        )
-        assert turbo_block and "q4f16" in turbo_block.group(1)
-        default_block = re.search(r"default:\s*\{(.*?)\n  \},", block.group(1), re.S)
-        assert default_block and "q4f16" not in default_block.group(1), (
-            "작은 모델에는 q4f16 파일이 없습니다"
-        )
+    def test_gpu_never_uses_int8_decoder(self):
+        """그래픽 가속에서 q8 디코더를 쓰면 GPU 커널이 없어 CPU 로 떨어진다.
 
+        디코더는 글자마다 도는 가장 무거운 부분이라 여기서 CPU 로 내려가면
+        빠른 모드를 켜 놓고도 느리다. 실제로 이것 때문에 느렸다.
+        """
+        engine = (WEB_DIR / "engine.js").read_text(encoding="utf-8")
+        block = re.search(r"export const MODEL_PROFILES = \{(.*?)\n\};", engine, re.S)
+        assert block
+        for profile, dec in re.findall(
+            r'(\w+):\s*\{\s*dtype:\s*\{[^}]*decoder_model_merged:\s*"(\w+)"',
+            block.group(1),
+        ):
+            if profile.startswith("webgpu"):
+                assert dec != "q8", f"{profile} 칸이 GPU 에서 못 도는 q8 디코더를 씁니다"
+
+    def test_threads_are_enabled_when_isolated(self):
+        """헤더가 붙었는데도 CPU 를 1개만 쓰면 몇 배 느려진다."""
+        engine = (WEB_DIR / "engine.js").read_text(encoding="utf-8")
+        assert "crossOriginIsolated" in engine, "스레드 조건을 확인하지 않습니다"
+        assert "numThreads" in engine, "스레드 수를 지정하지 않습니다"
+
+        worker_headers = (WEB_DIR / "coi-serviceworker.js").read_text(encoding="utf-8")
+        assert "Cross-Origin-Embedder-Policy" in worker_headers
+        assert "Cross-Origin-Opener-Policy" in worker_headers
+        # 외부 요청까지 가로채면 모델 내려받기를 방해할 수 있다
+        assert "self.location.origin" in worker_headers, "같은 출처만 처리해야 합니다"
+
+        page = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+        assert "coi-serviceworker.js" in page, "서비스 워커를 등록하지 않습니다"
     def test_retries_with_a_safe_precision_when_a_file_is_missing(self):
         engine = (WEB_DIR / "engine.js").read_text(encoding="utf-8")
         assert "FALLBACK_DTYPE" in engine
@@ -288,15 +324,17 @@ class TestBrowserOnlyWebApp:
         html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
         assert "whisper-large-v3-turbo" in html
 
-    def test_model_sizes_match_the_real_files(self):
-        """Hugging Face 에서 확인한 실제 크기와 표기가 맞아야 한다.
+    def test_model_sizes_are_not_hardcoded_in_the_page(self):
+        """내려받는 용량은 기기(그래픽 가속 여부)에 따라 다르다.
 
-        large-v3-turbo q4f16 = 인코더 370MB + 디코더 193MB = 약 560MB
-        small q4/q8         = 인코더 66MB + 디코더 157MB = 약 220MB
+        화면에 숫자를 박아 두면 어느 한쪽에서는 반드시 틀린 안내가 된다.
+        실제 값을 engine.js 의 표에서 읽어 오는지 확인한다.
         """
         html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
-        assert "560MB" in html
-        assert "220MB" in html
+        assert "MODEL_PROFILES" in html, "표에서 용량을 읽어 오지 않습니다"
+        assert "pickProfileKey" in html, "기기에 맞는 칸을 고르지 않습니다"
+        hardcoded = re.findall(r"(?:약 )?(\d{2,4})\s?MB", html)
+        assert not hardcoded, f"화면에 박아 둔 용량이 남아 있습니다: {hardcoded}"
 
     def test_picks_efficient_precision_per_device(self):
         engine = (WEB_DIR / "engine.js").read_text(encoding="utf-8")

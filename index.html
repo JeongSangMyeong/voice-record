@@ -102,10 +102,10 @@
       <div>
         <label class="f" for="model">정확도</label>
         <select id="model">
-          <option value="onnx-community/whisper-large-v3-turbo">가장 정확 — 한국어 권장 (약 560MB)</option>
-          <option value="onnx-community/whisper-small" selected>보통 — 균형 (약 220MB)</option>
-          <option value="onnx-community/whisper-base">낮음 — 빠름 (약 80MB)</option>
-          <option value="onnx-community/whisper-tiny">아주 낮음 — 가장 빠름 (약 40MB)</option>
+          <option value="onnx-community/whisper-large-v3-turbo">가장 정확 — 한국어 권장</option>
+          <option value="onnx-community/whisper-small" selected>보통 — 균형 (권장)</option>
+          <option value="onnx-community/whisper-base">낮음 — 빠름</option>
+          <option value="onnx-community/whisper-tiny">아주 낮음 — 가장 빠름</option>
         </select>
         <div class="status" style="margin-top:6px">
           한국어는 <b>가장 정확</b>을 권합니다. 처음 한 번만 받고 이후엔 저장됩니다.
@@ -139,11 +139,13 @@
   </div>
 
   <p class="foot">
+    <span id="devinfo"></span><br />
     변환은 이 기기 안에서만 이루어집니다.<br />
     녹음 파일이 서버로 전송되지 않습니다.
   </p>
 </div>
 
+<script src="coi-serviceworker.js"></script>
 <script type="module">
 "use strict";
 const $ = (id) => document.getElementById(id);
@@ -154,13 +156,15 @@ const downloaded = new Map();
 const downloadBytes = new Map();
 let stallTimer = null;
 let currentPhase = "";
+let profileKey = "wasm";
+let modelSizes = null;
 let planTotal = 0;
 let onMainThread = false;
 let cancelled = false;
 let workerFailed = false;      // 작업자가 한 번 실패하면 이후에는 바로 우회한다
 let mainThreadBusy = false;
 // 파일을 고칠 때마다 올린다. 브라우저가 예전 파일을 쓰지 않게 하는 용도.
-const APP_VERSION = "10";
+const APP_VERSION = "13";
 
 /* ---------- 보안 연결 확인 (마이크는 https 에서만 된다) ---------- */
 if (!window.isSecureContext) {
@@ -269,11 +273,33 @@ async function checkDevice() {
   } catch {
     hasWebGPU = false;
   }
+  // 지금 이 기기가 어떤 조건인지 그대로 보여 준다. 느릴 때 원인을 알 수 있다.
+  const cores = navigator.hardwareConcurrency || 0;
+  const threads = window.crossOriginIsolated ? Math.max(1, Math.min(4, cores)) : 1;
+  // 내려받는 용량은 기기(그래픽 가속 여부)에 따라 다르다. 실제 값을 읽어 온다.
+  try {
+    const eng = await import(`./engine.js?v=${APP_VERSION}`);
+    profileKey = await eng.pickProfileKey(hasWebGPU ? "webgpu" : "wasm");
+    modelSizes = eng.MODEL_PROFILES;
+  } catch {
+    /* 못 읽어도 안내 문구만 덜 자세해질 뿐이다 */
+  }
+  $("devinfo").textContent =
+    `이 기기: ${hasWebGPU ? "빠른 모드(WebGPU) 사용 가능" : "일반 모드"}` +
+    ` · CPU ${cores || "?"}개 중 ${threads}개 사용` +
+    (window.crossOriginIsolated ? "" : " (여러 개를 쓰려면 새로고침이 한 번 필요합니다)");
   updateModelHint();
+}
+
+/** 이 기기에서 이 모델을 고르면 실제로 몇 MB 를 받는지. 모르면 null. */
+function sizeForSelected() {
+  return modelSizes?.[$("model").value]?.[profileKey]?.sizeMB ?? null;
 }
 
 function updateModelHint() {
   const big = $("model").value.includes("large");
+  const mb = sizeForSelected();
+  const sizeNote = mb === null ? "" : ` (약 ${mb}MB)`;
   const box = $("firstRun");
   box.classList.remove("hidden");
 
@@ -282,16 +308,16 @@ function updateModelHint() {
     box.innerHTML =
       "이 기기는 <b>빠른 모드(WebGPU)를 지원하지 않습니다.</b> " +
       "가장 정확한 모델은 매우 느리고 휴대폰이 뜨거워질 수 있습니다.<br />" +
-      "<b>보통(약 220MB)</b> 을 권합니다. 그래도 쓰시려면 짧은 녹음으로 먼저 시험해 보세요.";
+      "<b>보통</b> 을 권합니다. 그래도 쓰시려면 짧은 녹음으로 먼저 시험해 보세요.";
     return;
   }
   box.className = "note info";
   box.innerHTML = big
-    ? "가장 정확한 모델은 <b>약 560MB</b> 를 내려받습니다. " +
+    ? `가장 정확한 모델을 내려받습니다<b>${sizeNote}</b>. ` +
       "<b>와이파이</b>에서, 받는 동안 <b>이 화면을 그대로 두세요.</b> " +
       "다른 앱으로 나가면 중단됩니다." +
       (hasWebGPU ? " (이 기기는 빠른 모드를 지원합니다 ✓)" : "")
-    : "처음 한 번만 음성인식 모델을 내려받습니다. 그 뒤로는 저장되어 빠르게 열립니다." +
+    : `처음 한 번만 음성인식 모델을 내려받습니다${sizeNote}. 그 뒤로는 저장되어 빠르게 열립니다.` +
       (hasWebGPU ? " 이 기기는 빠른 모드를 지원합니다 ✓" : "");
 }
 
@@ -361,9 +387,12 @@ $("go").addEventListener("click", async () => {
 
 let wakeLock = null;
 let leftDuringWork = false;
+// 작업 중에는 서비스 워커가 페이지를 새로고침하지 못하게 막는 표시
+window.__transcribing = false;
 
 /** 처리하는 동안 화면이 꺼지지 않게 한다. 화면이 꺼지면 다운로드가 끊긴다. */
 async function keepAwake() {
+  window.__transcribing = true;   // 이 동안에는 페이지를 새로고침하지 않는다
   try {
     if ("wakeLock" in navigator) wakeLock = await navigator.wakeLock.request("screen");
   } catch {
@@ -372,6 +401,7 @@ async function keepAwake() {
 }
 
 function releaseAwake() {
+  window.__transcribing = false;
   try { wakeLock?.release(); } catch {}
   wakeLock = null;
 }
@@ -494,8 +524,10 @@ function onWorker(event) {
     $("firstRun").classList.add("hidden");
     armStallNotice();
   } else if (d.type === "device") {
+    // 느릴 때 원인을 바로 알 수 있게, 실제로 무엇으로 도는지 그대로 쓴다.
     $("statusText").textContent = d.device === "webgpu"
-      ? "빠른 모드(WebGPU)로 처리합니다" : "처리 중… (이 기기에서는 시간이 조금 걸립니다)";
+      ? "빠른 모드(그래픽 가속)로 처리합니다"
+      : `처리 중… (CPU ${d.threads}개 사용)`;
   } else if (d.type === "plan") {
     // 말이 있는 부분만 골라 냈다는 걸 알려 준다.
     const skipped = Math.max(0, d.totalSeconds - d.speechSeconds);

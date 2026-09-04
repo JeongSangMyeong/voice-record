@@ -55,6 +55,40 @@ async function loadLibrary() {
   }
   pipelineFn = lib.pipeline;
   lib.env.allowLocalModels = false; // 원격 모델만 쓴다
+  tuneThreads(lib.env);
+}
+
+/**
+ * CPU 를 몇 개 쓸지 정한다. 여기가 속도에 가장 크게 영향을 준다.
+ *
+ * 라이브러리 기본값은 `crossOriginIsolated` 가 아니면 무조건 1개다.
+ * (라이브러리 소스: `if (!self.crossOriginIsolated) wasm.numThreads = 1`)
+ * 즉 헤더가 없으면 8코어 폰도 코어 1개로만 돌아 몇 배 느려진다.
+ * coi-serviceworker.js 가 그 헤더를 붙여 주므로 여기서 실제로 올린다.
+ *
+ * isolated 일 때 기본값은 min(4, 코어수/2) 인데, 코어를 절반만 쓴다.
+ * 받아쓰기는 순수 계산이라 코어를 더 써도 손해가 없어 4개까지 올린다.
+ */
+function tuneThreads(env) {
+  try {
+    const wasm = env?.backends?.onnx?.wasm;
+    if (!wasm) return;
+    if (!globalThis.crossOriginIsolated) {
+      wasm.numThreads = 1; // 헤더가 없으면 1보다 크게 두면 오히려 실패한다
+      return;
+    }
+    const cores = globalThis.navigator?.hardwareConcurrency || 1;
+    wasm.numThreads = Math.max(1, Math.min(4, cores));
+  } catch {
+    /* 라이브러리 구조가 바뀌어도 동작 자체에는 지장이 없다 */
+  }
+}
+
+/** 지금 실제로 쓰는 CPU 개수. 화면에 그대로 보여 주려고 읽는다. */
+function currentThreads() {
+  if (!globalThis.crossOriginIsolated) return 1;
+  const cores = globalThis.navigator?.hardwareConcurrency || 1;
+  return Math.max(1, Math.min(4, cores));
 }
 
 /**
@@ -67,17 +101,48 @@ async function loadLibrary() {
  * 이름과 실제 파일의 대응(라이브러리 소스 기준):
  *   q4 -> _q4.onnx, q8 -> _quantized.onnx, q4f16 -> _q4f16.onnx
  */
-const DTYPE_BY_MODEL = {
+/**
+ * 모델·기기별로 어떤 정밀도 파일을 쓸지 정한 표.
+ *
+ * 두 가지를 동시에 지킨다.
+ *
+ * 1) **실제로 올라와 있는 파일만 쓴다.**
+ *    q4f16 은 large-v3-turbo 에만 있다. 없는 걸 지정하면
+ *    "Could not locate file" 로 실패한다(실제로 겪었다).
+ *
+ * 2) **그래픽 가속(WebGPU)에서 실제로 GPU 로 도는 형식을 쓴다.**
+ *    q8(=_quantized)은 int8 연산이라 WebGPU 에 대응 커널이 없어
+ *    CPU 로 되돌아간다. 디코더는 글자 하나마다 도는 가장 무거운 부분이라,
+ *    여기서 CPU 로 떨어지면 그래픽 가속을 켜 놓고도 느리다.
+ *    그래서 GPU 에서는 q4(MatMulNBits, GPU 커널 있음)를 쓴다.
+ *    파일은 조금 더 크지만 한 번만 받으면 된다.
+ *
+ * sizeMB 는 실제 파일 크기의 합이다(Hugging Face 확인).
+ * 화면에 안내하는 용량과 테스트가 이 값을 함께 본다.
+ *
+ * 이름과 실제 파일의 대응(라이브러리 소스 기준):
+ *   q4 -> _q4.onnx, q8 -> _quantized.onnx, q4f16 -> _q4f16.onnx
+ */
+export const MODEL_PROFILES = {
   "onnx-community/whisper-large-v3-turbo": {
-    // 인코더 370MB + 디코더 193MB = 약 560MB
-    fp16: { encoder_model: "q4f16", decoder_model_merged: "q4f16" },
-    // fp16 을 못 쓰는 기기용. 용량이 커지지만 확실히 존재하는 조합이다.
-    safe: { encoder_model: "q4", decoder_model_merged: "q4" },
+    webgpu_f16: { dtype: { encoder_model: "q4f16", decoder_model_merged: "q4f16" }, sizeMB: 537 },
+    webgpu: { dtype: { encoder_model: "q4", decoder_model_merged: "q4" }, sizeMB: 724 },
+    wasm: { dtype: { encoder_model: "q4", decoder_model_merged: "q4" }, sizeMB: 724 },
   },
-  default: {
-    // tiny/base/small 공통. small 기준 인코더 66MB + 디코더 157MB = 약 220MB
-    fp16: { encoder_model: "q4", decoder_model_merged: "q8" },
-    safe: { encoder_model: "q4", decoder_model_merged: "q8" },
+  "onnx-community/whisper-small": {
+    webgpu_f16: { dtype: { encoder_model: "q4", decoder_model_merged: "q4" }, sizeMB: 285 },
+    webgpu: { dtype: { encoder_model: "q4", decoder_model_merged: "q4" }, sizeMB: 285 },
+    wasm: { dtype: { encoder_model: "q4", decoder_model_merged: "q8" }, sizeMB: 213 },
+  },
+  "onnx-community/whisper-base": {
+    webgpu_f16: { dtype: { encoder_model: "q4", decoder_model_merged: "q4" }, sizeMB: 136 },
+    webgpu: { dtype: { encoder_model: "q4", decoder_model_merged: "q4" }, sizeMB: 136 },
+    wasm: { dtype: { encoder_model: "q4", decoder_model_merged: "q8" }, sizeMB: 69 },
+  },
+  "onnx-community/whisper-tiny": {
+    webgpu_f16: { dtype: { encoder_model: "q4", decoder_model_merged: "q4" }, sizeMB: 91 },
+    webgpu: { dtype: { encoder_model: "q4", decoder_model_merged: "q4" }, sizeMB: 91 },
+    wasm: { dtype: { encoder_model: "q4", decoder_model_merged: "q8" }, sizeMB: 38 },
   },
 };
 
@@ -94,10 +159,16 @@ async function supportsFp16() {
   }
 }
 
+/** 지금 기기에 맞는 칸 이름. 화면 쪽에서도 용량 안내에 쓴다. */
+export async function pickProfileKey(device) {
+  if (device !== "webgpu") return "wasm";
+  return (await supportsFp16()) ? "webgpu_f16" : "webgpu";
+}
+
 async function pickDtype(model, device) {
-  const table = DTYPE_BY_MODEL[model] || DTYPE_BY_MODEL.default;
-  if (device === "webgpu" && (await supportsFp16())) return table.fp16;
-  return table.safe;
+  const profiles = MODEL_PROFILES[model];
+  if (!profiles) return FALLBACK_DTYPE;
+  return profiles[await pickProfileKey(device)].dtype;
 }
 
 async function getTranscriber(model, onEvent) {
@@ -249,7 +320,7 @@ export async function runTranscription(request, onEvent) {
 
   onEvent({ type: "phase", phase: "loading" });
   const { asr, device } = await getTranscriber(model, onEvent);
-  onEvent({ type: "device", device });
+  onEvent({ type: "device", device, threads: currentThreads() });
 
   onEvent({ type: "phase", phase: "transcribing" });
   const started = (globalThis.performance || Date).now();
