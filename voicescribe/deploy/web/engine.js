@@ -66,10 +66,14 @@ async function getTranscriber(model, onEvent) {
   transcriber = null;
   loadedKey = null;
 
-  // q8 은 크기와 정확도의 균형이 좋고 휴대폰 메모리에도 무리가 없다.
+  // 실제 파일 크기를 보고 고른 조합이다.
+  //  * WebGPU 는 fp16 을 쓸 수 있어 q4f16 이 가장 작고 빠르다
+  //    (large-v3-turbo 기준 인코더 370MB + 디코더 193MB)
+  //  * WebGPU 가 없으면 fp16 을 못 쓰므로 q4/q8 로 내려간다
+  //    (인코더는 q4 가 int8 보다 작고, 디코더는 int8 이 더 작다)
   const dtype = device === "webgpu"
-    ? { encoder_model: "fp32", decoder_model_merged: "q8" }
-    : { encoder_model: "q8", decoder_model_merged: "q8" };
+    ? { encoder_model: "q4f16", decoder_model_merged: "q4f16" }
+    : { encoder_model: "q4", decoder_model_merged: "q8" };
 
   transcriber = await pipelineFn("automatic-speech-recognition", model, {
     device,
@@ -109,14 +113,33 @@ export async function runTranscription(request, onEvent) {
   });
   const elapsed = ((globalThis.performance || Date).now() - started) / 1000;
 
-  return {
-    type: "done",
-    text: (result.text || "").trim(),
-    chunks: (result.chunks || []).map((c) => ({
+  let chunks = (result.chunks || [])
+    .map((c) => ({
       start: c.timestamp?.[0] ?? 0,
       end: c.timestamp?.[1] ?? 0,
       text: (c.text || "").trim(),
-    })),
+    }))
+    .filter((c) => c.text);
+
+  let speakers = 0;
+  if (request.diarize && chunks.length > 1) {
+    onEvent({ type: "status", text: "화자 구분 중" });
+    try {
+      const { assignSpeakers } = await import("./diarize.js");
+      const labels = assignSpeakers(audio, chunks, sampleRate);
+      chunks = chunks.map((c, i) => ({ ...c, speaker: labels[i] }));
+      speakers = new Set(labels).size;
+    } catch (error) {
+      // 화자 구분은 부가 기능이다. 실패해도 받아쓰기 결과는 그대로 준다.
+      onEvent({ type: "status", text: "화자 구분을 건너뜁니다" });
+    }
+  }
+
+  return {
+    type: "done",
+    text: (result.text || "").trim(),
+    chunks,
+    speakers,
     elapsed,
     duration: audio.length / sampleRate,
     device,

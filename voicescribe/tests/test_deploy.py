@@ -142,8 +142,41 @@ class TestBrowserOnlyWebApp:
     업로드 코드가 실수로 들어오면 그 약속이 깨지므로 검사한다.
     """
 
+    def test_offers_an_accurate_model_for_korean(self):
+        """base 만으로는 한국어 정확도가 부족하다. 더 정확한 선택지가 있어야 한다."""
+        html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+        assert "whisper-large-v3-turbo" in html
+
+    def test_model_sizes_match_the_real_files(self):
+        """Hugging Face 에서 확인한 실제 크기와 표기가 맞아야 한다.
+
+        large-v3-turbo q4f16 = 인코더 370MB + 디코더 193MB = 약 560MB
+        small q4/q8         = 인코더 66MB + 디코더 157MB = 약 220MB
+        """
+        html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+        assert "560MB" in html
+        assert "220MB" in html
+
+    def test_picks_efficient_precision_per_device(self):
+        engine = (WEB_DIR / "engine.js").read_text(encoding="utf-8")
+        assert "q4f16" in engine        # WebGPU 에서 가장 작고 빠르다
+        assert "webgpu" in engine
+
+    def test_supports_speaker_separation(self):
+        html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+        engine = (WEB_DIR / "engine.js").read_text(encoding="utf-8")
+        assert (WEB_DIR / "diarize.js").exists()
+        assert 'id="diarize"' in html
+        assert "diarize.js" in engine
+
+    def test_diarization_failure_does_not_lose_the_transcript(self):
+        """화자 구분은 부가 기능이다. 실패해도 받아쓴 내용은 나와야 한다."""
+        engine = (WEB_DIR / "engine.js").read_text(encoding="utf-8")
+        index = engine.index("assignSpeakers")
+        assert "catch" in engine[index : index + 600]
+
     def test_required_files_exist(self):
-        for name in ("index.html", "worker.js", "engine.js", "올리는방법.md"):
+        for name in ("index.html", "worker.js", "engine.js", "diarize.js", "올리는방법.md"):
             assert (WEB_DIR / name).exists(), f"{name} 이 없습니다"
 
     def test_falls_back_to_the_main_thread(self):
