@@ -544,6 +544,62 @@ class TestBrowserOnlyWebApp:
         )
         assert "한국어는 <b>가장 정확</b>을 권합니다" not in html, "옛 안내가 남아 있습니다"
 
+    def test_windows_cover_the_whole_recording(self):
+        """조용한 부분을 버리고 자르면 경계에서 말이 통째로 사라진다.
+
+        실제 회의 녹음(2분)으로 잰 결과다. 단어 오류율 / 빠뜨린 단어 수:
+          무음 버림 28초   40.9%  32개
+          무음 버림 20초   51.1%  61개   ← 구간 길이만 바꿔도 무너진다
+          전체 덮기 28초   39.2%  30개
+          전체 덮기 15초   39.2%  30개   ← 어느 길이든 일정하다
+        전체를 덮되 경계는 쉬는 자리로 잡아야 한다.
+        """
+        node = shutil.which("node")
+        if not node:
+            pytest.skip("node 가 없어 건너뜁니다")
+
+        engine = (WEB_DIR / "engine.js").read_text(encoding="utf-8")
+        assert "tileAtPauses(audio, sampleRate)" in engine, "전체를 덮는 방식을 쓰지 않습니다"
+
+        script = f"""
+        const {{ tileAtPauses }} = await import("{(WEB_DIR / 'engine.js').as_posix()}");
+        const sr = 16000;
+        const make = (seconds, speaking) => {{
+          const a = new Float32Array(sr * seconds);
+          for (let i = 0; i < a.length; i++) if (speaking(i / sr)) a[i] = Math.sin(i * 0.05) * 0.3;
+          return a;
+        }};
+        const cases = [
+          ["쉼 있는 긴 소리", make(120, (t) => t % 7 < 5), 120],
+          ["끊김 없는 긴 소리", make(120, () => true), 120],
+          ["짧은 소리", make(5, () => true), 5],
+          ["말이 가운데만", make(40, (t) => t > 10 && t < 25), 40],
+        ];
+        const out = [];
+        for (const [name, audio, total] of cases) {{
+          const w = tileAtPauses(audio, sr);
+          // 말이 있는 부분이 모두 어느 구간엔가 들어 있는지 확인한다
+          let uncovered = 0;
+          for (let t = 0; t < total; t += 0.1) {{
+            const i = Math.floor(t * sr);
+            if (Math.abs(audio[i]) < 0.01) continue;              // 조용한 지점은 넘어간다
+            if (!w.some((x) => t >= x.start - 0.05 && t <= x.end + 0.05)) uncovered++;
+          }}
+          out.push({{ name, windows: w.length, uncovered,
+            longest: w.length ? Math.max(...w.map((x) => x.end - x.start)) : 0 }});
+        }}
+        console.log(JSON.stringify(out));
+        """
+        result = subprocess.run(
+            [node, "--input-type=module", "-e", script],
+            capture_output=True, text=True, timeout=120,
+        )
+        assert result.returncode == 0, result.stderr
+        for row in json.loads(result.stdout.strip().splitlines()[-1]):
+            assert row["uncovered"] == 0, f"{row['name']}: 말이 있는 부분을 {row['uncovered']}군데 빠뜨렸습니다"
+            assert row["longest"] <= 28.05, f"{row['name']}: 구간이 30초 제한을 넘습니다"
+            assert row["windows"] > 0, f"{row['name']}: 구간이 하나도 없습니다"
+
     def test_web_files_at_the_root_match_the_deploy_copy(self):
         """뿌리의 파일이 실제로 배포되는 파일이다. 테스트는 배포본만 본다.
 

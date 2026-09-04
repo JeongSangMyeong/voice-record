@@ -324,6 +324,85 @@ function toWindows(ranges, audio, sampleRate, maxSeconds = WINDOW_SECONDS) {
 }
 
 
+/**
+ * 소리 전체를 빠짐없이 덮는 구간으로 나눈다. 경계는 조용한 곳 한가운데로 잡는다.
+ *
+ * 예전에는 조용한 부분을 아예 버리고 말하는 구간만 넘겼는데, 그러면 경계에서
+ * 말이 잘려 통째로 사라진다. 실제 회의 녹음(2분)으로 재 보니 그 방식은
+ * 구간 길이에 따라 결과가 크게 흔들렸다.
+ *
+ *   무음 버림 28초   단어오류 40.9%  빠뜨린 단어 32개
+ *   무음 버림 20초   단어오류 51.1%  빠뜨린 단어 61개   ← 길이만 바꿔도 무너진다
+ *   전체 덮기 28초   단어오류 39.2%  빠뜨린 단어 30개
+ *   전체 덮기 20초   단어오류 40.5%  빠뜨린 단어 34개
+ *   전체 덮기 15초   단어오류 39.2%  빠뜨린 단어 30개   ← 어느 길이든 일정하다
+ *
+ * 다만 아무 소리도 없는 구간까지 넘기면 Whisper 가 없는 말을 지어내는 일이
+ * 있어, 통째로 조용한 구간은 건너뛴다.
+ */
+export function tileAtPauses(audio, sampleRate, maxSeconds = WINDOW_SECONDS) {
+  const totalSeconds = audio.length / sampleRate;
+  const frame = Math.max(1, Math.round(sampleRate * 0.02));
+  const frames = Math.floor(audio.length / frame);
+
+  const energy = new Float32Array(frames);
+  let loudest = 0;
+  for (let f = 0; f < frames; f++) {
+    let sum = 0;
+    for (let i = f * frame; i < (f + 1) * frame; i++) sum += audio[i] * audio[i];
+    energy[f] = Math.sqrt(sum / frame);
+    if (energy[f] > loudest) loudest = energy[f];
+  }
+  const quiet = loudest * 0.06;
+
+  const make = (start, end) => ({
+    start,
+    end,
+    from: Math.floor(start * sampleRate),
+    to: Math.min(audio.length, Math.ceil(end * sampleRate)),
+  });
+
+  let windows;
+  if (totalSeconds <= maxSeconds) {
+    windows = [make(0, totalSeconds)];
+  } else {
+    // 조용한 구간의 한가운데를 경계 후보로 모은다.
+    const pauses = [];
+    let run = -1;
+    for (let f = 0; f <= frames; f++) {
+      const isQuiet = f < frames && energy[f] < quiet;
+      if (isQuiet && run < 0) run = f;
+      else if (!isQuiet && run >= 0) {
+        if ((f - run) * frame >= sampleRate * 0.2) pauses.push((((run + f) / 2) * frame) / sampleRate);
+        run = -1;
+      }
+    }
+    windows = [];
+    let start = 0;
+    const minSeconds = Math.min(3, maxSeconds / 2);
+    while (start < totalSeconds - 0.05) {
+      let end = Math.min(totalSeconds, start + maxSeconds);
+      if (end < totalSeconds) {
+        let latest = -1;
+        for (const pause of pauses) {
+          if (pause > start + minSeconds && pause <= end && pause > latest) latest = pause;
+        }
+        if (latest > 0) end = latest;
+      }
+      windows.push(make(start, end));
+      start = end;
+    }
+  }
+
+  // 아무 말도 없는 구간은 넘기지 않는다(없는 말을 지어내는 것을 막는다).
+  return windows.filter((w) => {
+    const first = Math.floor(w.start * sampleRate / frame);
+    const last = Math.min(frames, Math.ceil(w.end * sampleRate / frame));
+    for (let f = first; f < last; f++) if (energy[f] > quiet) return true;
+    return false;
+  });
+}
+
 /** 오디오를 받아쓴다(내부 구현). */
 async function runWhisper(request, onEvent) {
   const { audio, model, language, sampleRate } = request;
@@ -338,7 +417,7 @@ async function runWhisper(request, onEvent) {
   // 라이브러리에 통째로 맡기면 내부에서 30초씩 잘라 돌리는데 진행 상황을
   // 전혀 알려 주지 않는다. 직접 잘라서 돌리면 진행률을 보여줄 수 있고,
   // 말이 없는 구간을 아예 건너뛸 수 있어 통화 녹음에서 특히 빨라진다.
-  const windows = splitIntoWindows(audio, sampleRate);
+  const windows = tileAtPauses(audio, sampleRate);
   const speechSeconds = windows.reduce((sum, w) => sum + (w.end - w.start), 0);
   onEvent({
     type: "plan",
