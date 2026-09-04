@@ -406,13 +406,97 @@ class TestBrowserOnlyWebApp:
         diarize = (WEB_DIR / "diarize.js").read_text(encoding="utf-8")
         assert "nearestCentroid" in diarize and "centroidsOf" in diarize
 
+    def test_saved_file_opens_without_broken_korean(self):
+        """UTF-8 파일에 BOM 이 없으면 윈도우 메모장·엑셀이 cp949 로 읽어 한글이 깨진다.
+
+        옛 메모장은 LF 만 있으면 전부 한 줄로 붙여 버리므로 줄바꿈도 CRLF 로 맞춘다.
+        """
+        html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+        save = html[html.index('$("save").addEventListener') :]
+        save = save[: save.index("});") + 3]
+        assert "\\uFEFF" in save, "저장 파일에 BOM 을 붙이지 않습니다 (한글이 깨집니다)"
+        assert "\\r\\n" in save, "줄바꿈을 CRLF 로 바꾸지 않습니다"
+
+    def test_saved_bytes_really_start_with_a_bom(self):
+        """문자열 검사만으로는 부족하다. 실제로 나오는 바이트를 확인한다."""
+        node = shutil.which("node")
+        if not node:
+            pytest.skip("node 가 없어 건너뜁니다")
+        script = r"""
+        const text = "\uFEFF" + "\uc548\ub155\ud558\uc138\uc694\n\ub458\uc9f8 \uc904".replace(/\r?\n/g, "\r\n");
+        const bytes = new TextEncoder().encode(text);
+        console.log(JSON.stringify({
+          head: [...bytes.slice(0, 3)],
+          crlf: [...bytes].some((b, i) => b === 13 && bytes[i + 1] === 10),
+          // TextDecoder 는 BOM 을 알아서 떼어내므로 첫 글자부터 본문이다
+          roundtrip: new TextDecoder("utf-8").decode(bytes).slice(0, 5),
+        }));
+        """
+        result = subprocess.run(
+            [node, "--input-type=module", "-e", script],
+            capture_output=True, text=True, timeout=60,
+        )
+        assert result.returncode == 0, result.stderr
+        r = json.loads(result.stdout.strip().splitlines()[-1])
+        assert r["head"] == [239, 187, 191], f"BOM 이 아닙니다: {r['head']}"
+        assert r["crlf"], "CRLF 줄바꿈이 없습니다"
+        assert r["roundtrip"] == "안녕하세요", f"한글이 깨졌습니다: {r['roundtrip']}"
+
+    def test_notification_goes_through_the_service_worker(self):
+        """안드로이드 크롬은 new Notification() 을 막는다.
+
+        서비스 워커의 showNotification 을 써야 휴대폰에 알림이 뜬다.
+        """
+        html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+        assert "registration.showNotification" in html, "서비스 워커로 알림을 띄우지 않습니다"
+        assert "requestPermission" in html
+        # 권한 요청은 사용자가 직접 누른 순간에만 가능하다
+        assert 'addEventListener("change"' in html
+        worker = (WEB_DIR / "coi-serviceworker.js").read_text(encoding="utf-8")
+        assert "notificationclick" in worker, "알림을 눌러도 앱으로 돌아오지 않습니다"
+
+    def test_notification_never_breaks_unsupported_browsers(self):
+        """알림은 덤이다. 지원하지 않는 브라우저에서 오류가 나면 안 된다."""
+        html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+        assert 'typeof Notification !== "undefined"' in html
+        assert "isSecureContext" in html
+        # 서비스 워커가 늦거나 없을 때 영영 기다리면 안 된다
+        assert "Promise.race" in html, "navigator.serviceWorker.ready 에 시간 제한이 없습니다"
+
+    def test_installable_so_iphone_can_get_notifications(self):
+        """아이폰은 홈 화면에 추가해야만 알림을 받을 수 있다(iOS 16.4 이상)."""
+        import json as _json
+
+        manifest_path = WEB_DIR / "manifest.json"
+        assert manifest_path.exists(), "manifest.json 이 없어 홈 화면 앱이 되지 않습니다"
+        manifest = _json.loads(manifest_path.read_text(encoding="utf-8"))
+        assert manifest["display"] == "standalone"
+        for icon in manifest["icons"]:
+            assert (WEB_DIR / icon["src"]).exists(), f"아이콘 파일이 없습니다: {icon['src']}"
+        html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+        assert 'rel="manifest"' in html
+        assert "apple-touch-icon" in html
+
+    def test_saving_offers_share_on_phones(self):
+        """홈 화면에 추가한 아이폰 앱에서는 그냥 내려받기가 막히는 경우가 있다.
+
+        공유가 되면 공유를 먼저 쓰고, 안 되면 내려받기로 돌아가야 한다.
+        """
+        html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+        assert "navigator.canShare" in html and "navigator.share" in html
+        assert "AbortError" in html, "사용자가 공유를 취소한 경우를 오류로 처리하면 안 됩니다"
+        # 공유가 안 되는 기기를 위해 내려받기 경로는 남아 있어야 한다
+        assert "a.download = name" in html
+
     def test_web_files_at_the_root_match_the_deploy_copy(self):
         """뿌리의 파일이 실제로 배포되는 파일이다. 테스트는 배포본만 본다.
 
         둘이 어긋나면 검사를 통과했는데도 사용자에게는 옛 파일이 간다.
         """
         root = WEB_DIR.parent.parent.parent
-        for name in ("index.html", "engine.js", "diarize.js", "worker.js", "coi-serviceworker.js"):
+        for name in ("index.html", "engine.js", "diarize.js", "worker.js",
+                     "coi-serviceworker.js", "manifest.json",
+                     "icon-192.png", "icon-512.png", "apple-touch-icon.png"):
             here, there = root / name, WEB_DIR / name
             if not here.exists():
                 continue

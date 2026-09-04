@@ -16,6 +16,19 @@ if (typeof window === "undefined") {
   self.addEventListener("install", () => self.skipWaiting());
   self.addEventListener("activate", (event) => event.waitUntil(self.clients.claim()));
 
+  // 알림을 누르면 이 사이트 탭으로 돌아온다.
+  self.addEventListener("notificationclick", (event) => {
+    event.notification.close();
+    event.waitUntil(
+      self.clients.matchAll({ type: "window", includeUncontrolled: true }).then((list) => {
+        for (const client of list) {
+          if (client.url.startsWith(self.location.origin) && "focus" in client) return client.focus();
+        }
+        return self.clients.openWindow ? self.clients.openWindow("./") : undefined;
+      }),
+    );
+  });
+
   self.addEventListener("fetch", (event) => {
     const request = event.request;
 

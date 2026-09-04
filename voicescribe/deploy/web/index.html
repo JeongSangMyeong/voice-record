@@ -116,6 +116,11 @@
       <input type="checkbox" id="diarize" checked style="width:20px;height:20px" />
       화자 구분하기 (누가 말했는지 나눠서 표시 · 처음 한 번 26MB 더 받음)
     </label>
+    <label class="chip-row" id="notifyRow" style="display:none;align-items:center;gap:8px;margin-top:10px;font-size:15px;cursor:pointer">
+      <input type="checkbox" id="notify" style="width:20px;height:20px" />
+      다 되면 휴대폰 알림으로 알려주기
+    </label>
+    <div id="notifyNote" class="status hidden" style="margin-top:6px"></div>
     <button id="go" class="primary" style="margin-top:14px" disabled>받아쓰기 시작</button>
   </div>
 
@@ -134,7 +139,7 @@
     <textarea id="out" readonly></textarea>
     <div class="row" style="margin-top:12px">
       <button id="copy">📋 복사</button>
-      <button id="save">⬇ 파일로 저장</button>
+      <button id="save">⬇ 파일로 저장 · 공유</button>
     </div>
   </div>
 
@@ -145,6 +150,12 @@
   </p>
 </div>
 
+<link rel="manifest" href="manifest.json" />
+<link rel="apple-touch-icon" href="apple-touch-icon.png" />
+<link rel="icon" href="icon-192.png" />
+<meta name="theme-color" content="#2563eb" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-title" content="받아쓰기" />
 <script src="coi-serviceworker.js"></script>
 <script type="module">
 "use strict";
@@ -165,7 +176,7 @@ let cancelled = false;
 let workerFailed = false;      // 작업자가 한 번 실패하면 이후에는 바로 우회한다
 let mainThreadBusy = false;
 // 파일을 고칠 때마다 올린다. 브라우저가 예전 파일을 쓰지 않게 하는 용도.
-const APP_VERSION = "15";
+const APP_VERSION = "18";
 
 /* ---------- 보안 연결 확인 (마이크는 https 에서만 된다) ---------- */
 if (!window.isSecureContext) {
@@ -387,6 +398,84 @@ $("go").addEventListener("click", async () => {
   }
   runOnMainThread(request);
 });
+
+/* ---------- 휴대폰 알림 ---------- */
+
+/**
+ * 이 알림은 '지금 이 페이지가 살아 있을 때' 울리는 알림이다.
+ * 카톡처럼 서버가 밀어 주는 알림(푸시)이 아니다.
+ * 다만 받아쓰기 자체가 이 페이지에서 도는 것이라, 페이지가 죽으면 작업도 같이
+ * 멈춘다. 즉 '작업이 끝났다' 는 알림은 작업이 끝날 수 있는 상황에서는 항상 뜬다.
+ */
+function canNotify() {
+  return typeof Notification !== "undefined" && window.isSecureContext;
+}
+
+async function askNotifyPermission() {
+  if (!canNotify()) return "unsupported";
+  if (Notification.permission === "granted") return "granted";
+  if (Notification.permission === "denied") return "denied";
+  try {
+    return await Notification.requestPermission();   // 사용자가 체크한 그 순간에만 물을 수 있다
+  } catch {
+    return "denied";
+  }
+}
+
+/** 서비스 워커를 통해 알림을 띄운다. 안드로이드 크롬은 이 방법만 허용한다. */
+async function showNotice(title, body) {
+  if (!canNotify() || Notification.permission !== "granted") return;
+  const options = {
+    body,
+    // 같은 표를 달아 두면 알림이 쌓이지 않고 하나가 갱신된다.
+    tag: "voice-record",
+    renotify: true,
+    icon: "icon-192.png",
+  };
+  try {
+    if (navigator.serviceWorker) {
+      // 서비스 워커가 없거나 늦으면 영영 기다릴 수 있어 시간 제한을 둔다.
+      const registration = await Promise.race([
+        navigator.serviceWorker.ready,
+        new Promise((resolve) => setTimeout(() => resolve(null), 3000)),
+      ]);
+      if (registration?.showNotification) {
+        await registration.showNotification(title, options);
+        return;
+      }
+    }
+    new Notification(title, options);   // 데스크톱 대비책
+  } catch {
+    // 알림은 덤이다. 실패해도 받아쓰기에는 지장이 없다.
+  }
+}
+
+function wantsNotice() {
+  return $("notify")?.checked && canNotify() && Notification.permission === "granted";
+}
+
+if (canNotify()) {
+  $("notifyRow").style.display = "flex";
+  $("notify").addEventListener("change", async () => {
+    if (!$("notify").checked) { $("notifyNote").classList.add("hidden"); return; }
+    const result = await askNotifyPermission();
+    const note = $("notifyNote");
+    note.classList.remove("hidden");
+    if (result === "granted") {
+      note.textContent = "다 되면 알림이 옵니다. 화면을 꺼 두어도 됩니다.";
+    } else {
+      $("notify").checked = false;
+      note.textContent =
+        result === "denied"
+          ? "알림이 차단되어 있습니다. 브라우저 설정에서 이 사이트의 알림을 허용해 주세요."
+          : "이 브라우저는 알림을 지원하지 않습니다. 아이폰은 홈 화면에 추가해야 알림이 됩니다.";
+    }
+  });
+} else {
+  // 아이폰 사파리는 홈 화면에 추가해야 알림을 쓸 수 있다(iOS 16.4 이상).
+  const row = $("notifyRow");
+  if (row) row.style.display = "none";
+}
 
 let wakeLock = null;
 let leftDuringWork = false;
@@ -628,6 +717,7 @@ function killWorker() {
 
 function showError(message) {
   window.__transcribing = false;
+  if (wantsNotice()) showNotice("받아쓰기가 중간에 멈췄습니다", friendlyError(message).split("\n")[0]);
   releaseAwake();
   $("prog").classList.add("hidden");
   $("err").classList.remove("hidden");
@@ -637,6 +727,13 @@ function showError(message) {
 
 function showResult(d) {
   window.__transcribing = false;
+  if (wantsNotice()) {
+    showNotice(
+      "받아쓰기가 끝났습니다",
+      `${fmtTime(d.duration)} 분량` + (d.speakers > 1 ? ` · 화자 ${d.speakers}명` : "") +
+        " — 눌러서 결과를 확인하세요",
+    );
+  }
   releaseAwake();
   $("prog").classList.add("hidden");
   $("go").disabled = false;
@@ -669,9 +766,29 @@ $("copy").addEventListener("click", async () => {
   setTimeout(() => $("copy").textContent = "📋 복사", 1800);
 });
 
-$("save").addEventListener("click", () => {
+$("save").addEventListener("click", async () => {
   const name = (picked?.name || "받아쓰기").replace(/\.[^.]+$/, "") + ".txt";
-  const url = URL.createObjectURL(new Blob([$("out").value], { type: "text/plain;charset=utf-8" }));
+  // 한글이 깨지지 않게 두 가지를 맞춰 준다.
+  //  1) 맨 앞에 BOM(\uFEFF): 없으면 윈도우 메모장·엑셀이 UTF-8 인 줄 모르고
+  //     cp949 로 읽어 "ìëíì¸ì" 처럼 깨진다.
+  //  2) 줄바꿈을 CRLF 로: 옛 메모장은 LF 만 있으면 전부 한 줄로 붙여 버린다.
+  const text = "\uFEFF" + $("out").value.replace(/\r?\n/g, "\r\n");
+  const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+
+  // 휴대폰에서는 '공유' 로 내보내는 편이 확실하다.
+  // 카톡·메일로 바로 보낼 수 있고, 홈 화면에 추가한 아이폰 앱에서는
+  // 그냥 내려받기가 동작하지 않는 경우가 있다.
+  try {
+    const file = new File([blob], name, { type: "text/plain" });
+    if (navigator.canShare?.({ files: [file] })) {
+      await navigator.share({ files: [file], title: name });
+      return;
+    }
+  } catch (error) {
+    if (error?.name === "AbortError") return;   // 사용자가 공유를 취소했다
+  }
+
+  const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url; a.download = name; a.click();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
