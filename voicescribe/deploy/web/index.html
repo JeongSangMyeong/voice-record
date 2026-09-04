@@ -141,6 +141,10 @@ let picked = null, recorder = null, chunks = [], timer = null, recStart = 0, wor
 let lastResult = null;
 const downloaded = new Map();
 let stallTimer = null;
+let workerFailed = false;      // 작업자가 한 번 실패하면 이후에는 바로 우회한다
+let mainThreadBusy = false;
+// 파일을 고칠 때마다 올린다. 브라우저가 예전 파일을 쓰지 않게 하는 용도.
+const APP_VERSION = "3";
 
 /* ---------- 보안 연결 확인 (마이크는 https 에서만 된다) ---------- */
 if (!window.isSecureContext) {
@@ -257,31 +261,24 @@ $("go").addEventListener("click", async () => {
 
   if (audio.length < SAMPLE_RATE * 0.2) return showError("소리가 너무 짧습니다.");
 
-  if (!worker) {
-    try {
-      worker = new Worker(new URL("./worker.js", import.meta.url), { type: "module" });
-    } catch (e) {
-      return showError("작업자를 만들지 못했습니다: " + (e.message || e));
-    }
-    worker.addEventListener("message", onWorker);
-    // 워커가 죽으면 반드시 버려야 한다. 그대로 두면 다음 시도에서 죽은 워커에
-    // 말을 걸게 되어 '모델 준비 중' 에서 영영 멈춘다.
-    worker.addEventListener("error", (e) => {
-      const detail = e.message || (e.filename ? `${e.filename}:${e.lineno}` : "");
-      killWorker();
-      showError(
-        "받아쓰기 모듈을 불러오지 못했습니다.\n" +
-          "인터넷 연결을 확인하고 다시 눌러 주세요.\n" +
-          (detail ? `(${detail})` : "(자세한 원인이 전달되지 않았습니다)"),
-      );
-    });
-    worker.addEventListener("messageerror", () => {
-      killWorker();
-      showError("작업자와 주고받는 데이터가 손상되었습니다. 다시 시도해 주세요.");
-    });
-  }
+  const request = {
+    audio, model: $("model").value, language: $("lang").value, sampleRate: SAMPLE_RATE,
+  };
+
   $("statusText").textContent = "모델 준비 중… (처음이면 시간이 걸립니다)";
-  // 오래 아무 소식이 없으면 멈춘 게 아닌지 알려 준다.
+  armStallNotice();
+
+  // 1순위: 작업자에서 돌린다(화면이 멈추지 않는다).
+  // 작업자가 뜨지 않는 브라우저라면 화면에서 직접 돌린다. 느리지만 동작은 한다.
+  if (!workerFailed) {
+    if (startWithWorker(request)) return;
+    workerFailed = true;
+  }
+  runOnMainThread(request);
+});
+
+/** 진행 소식이 한동안 없을 때 "멈춘 게 아니다" 라고 알려 준다. */
+function armStallNotice() {
   clearTimeout(stallTimer);
   stallTimer = setTimeout(() => {
     if (!$("prog").classList.contains("hidden")) {
@@ -289,10 +286,52 @@ $("go").addEventListener("click", async () => {
         "아직 모델을 내려받는 중입니다. 데이터가 크니 조금만 더 기다려 주세요…";
     }
   }, 20000);
-  worker.postMessage({
-    audio, model: $("model").value, language: $("lang").value, sampleRate: SAMPLE_RATE,
-  });
-});
+}
+
+/** 작업자로 시작한다. 만들지 못하면 false. */
+function startWithWorker(request) {
+  if (typeof Worker === "undefined") return false;
+  if (!worker) {
+    try {
+      // 주소에 버전을 붙여 예전 파일이 캐시에서 나오는 것을 막는다.
+      const url = new URL(`./worker.js?v=${APP_VERSION}`, import.meta.url);
+      worker = new Worker(url, { type: "module" });
+    } catch {
+      return false;                       // 모듈 작업자를 지원하지 않는 브라우저
+    }
+    worker.addEventListener("message", onWorker);
+    // 작업자가 죽으면 반드시 버린다. 그대로 두면 다음 시도에서 죽은 작업자에게
+    // 말을 걸게 되어 '모델 준비 중' 에서 영영 멈춘다.
+    worker.addEventListener("error", () => {
+      killWorker();
+      workerFailed = true;
+      $("statusText").textContent = "다른 방식으로 다시 시도합니다…";
+      runOnMainThread(request);           // 원인을 따지지 말고 우회한다
+    });
+    worker.addEventListener("messageerror", () => {
+      killWorker();
+      workerFailed = true;
+      runOnMainThread(request);
+    });
+  }
+  worker.postMessage(request);
+  return true;
+}
+
+/** 화면 쪽에서 직접 돌린다(작업자를 못 쓸 때의 대비책). */
+async function runOnMainThread(request) {
+  if (mainThreadBusy) return;
+  mainThreadBusy = true;
+  try {
+    const { runTranscription } = await import(`./engine.js?v=${APP_VERSION}`);
+    const result = await runTranscription(request, (e) => onWorker({ data: e }));
+    onWorker({ data: result });
+  } catch (error) {
+    showError(String(error?.message || error));
+  } finally {
+    mainThreadBusy = false;
+  }
+}
 
 function onWorker(event) {
   const d = event.data;
@@ -313,7 +352,7 @@ function onWorker(event) {
     $("fill").style.width = "100%";
     showResult(d);
   } else if (d.type === "error") {
-    killWorker();          // 한 번 실패한 워커는 버린다(다음 시도가 멈추지 않도록)
+    killWorker();          // 한 번 실패한 작업자는 버린다(다음 시도가 멈추지 않도록)
     showError(d.message);
   }
 }

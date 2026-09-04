@@ -143,14 +143,38 @@ class TestBrowserOnlyWebApp:
     """
 
     def test_required_files_exist(self):
-        for name in ("index.html", "worker.js", "올리는방법.md"):
+        for name in ("index.html", "worker.js", "engine.js", "올리는방법.md"):
             assert (WEB_DIR / name).exists(), f"{name} 이 없습니다"
+
+    def test_falls_back_to_the_main_thread(self):
+        """작업자가 어떤 이유로든 뜨지 않아도 동작해야 한다.
+
+        실제 안드로이드 기기에서 작업자가 원인 메시지도 없이 죽는 일이 있었다.
+        원인을 따지기 전에 우선 동작하도록 우회 경로를 둔다.
+        """
+        html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+        assert "runOnMainThread" in html
+        assert "engine.js" in html
+
+    def test_busts_the_browser_cache_on_update(self):
+        """파일을 고쳐도 브라우저가 예전 것을 쓰면 고친 의미가 없다."""
+        html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+        assert "APP_VERSION" in html
+        assert "worker.js?v=" in html
+
+    def test_engine_is_shared_by_both_paths(self):
+        """작업자와 화면 쪽이 같은 코드를 쓰도록 해 로직이 갈라지지 않게 한다."""
+        worker = (WEB_DIR / "worker.js").read_text(encoding="utf-8")
+        engine = (WEB_DIR / "engine.js").read_text(encoding="utf-8")
+        assert "./engine.js" in worker
+        assert "export async function runTranscription" in engine
 
     def test_never_uploads_audio(self):
         """서버로 오디오를 보내는 코드가 없어야 한다."""
         html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
         worker = (WEB_DIR / "worker.js").read_text(encoding="utf-8")
-        for name, text in (("index.html", html), ("worker.js", worker)):
+        engine = (WEB_DIR / "engine.js").read_text(encoding="utf-8")
+        for name, text in (("index.html", html), ("worker.js", worker), ("engine.js", engine)):
             assert "FormData" not in text, f"{name} 에 업로드 코드가 있습니다"
             assert "XMLHttpRequest" not in text, f"{name} 에 업로드 코드가 있습니다"
             # fetch 는 모델을 받을 때만 쓰이므로, 직접 호출이 없어야 한다.
@@ -158,7 +182,7 @@ class TestBrowserOnlyWebApp:
 
     def test_worker_pins_an_exact_library_version(self):
         """CDN 버전을 고정하지 않으면 어느 날 갑자기 깨질 수 있다."""
-        worker = (WEB_DIR / "worker.js").read_text(encoding="utf-8")
+        worker = (WEB_DIR / "engine.js").read_text(encoding="utf-8")
         assert "@huggingface/transformers@" in worker
         assert "@latest" not in worker
 
@@ -170,7 +194,7 @@ class TestBrowserOnlyWebApp:
         "작업자 오류: undefined" 만 뜬다. 실제로 겪었던 문제다.
         의존성이 모두 합쳐진 dist/transformers.min.js 를 써야 한다.
         """
-        worker = (WEB_DIR / "worker.js").read_text(encoding="utf-8")
+        worker = (WEB_DIR / "engine.js").read_text(encoding="utf-8")
         code = "\n".join(
             line for line in worker.splitlines() if not line.lstrip().startswith("//")
         )
@@ -178,7 +202,7 @@ class TestBrowserOnlyWebApp:
         assert "transformers.web.js" not in code
 
     def test_worker_has_a_fallback_cdn(self):
-        worker = (WEB_DIR / "worker.js").read_text(encoding="utf-8")
+        worker = (WEB_DIR / "engine.js").read_text(encoding="utf-8")
         assert "jsdelivr" in worker and "unpkg" in worker
 
     def test_page_discards_a_dead_worker(self):
@@ -189,12 +213,12 @@ class TestBrowserOnlyWebApp:
 
     def test_handles_audio_longer_than_thirty_seconds(self):
         """Whisper 는 한 번에 30초만 본다. 잘라서 처리하도록 설정해야 한다."""
-        worker = (WEB_DIR / "worker.js").read_text(encoding="utf-8")
+        worker = (WEB_DIR / "engine.js").read_text(encoding="utf-8")
         assert "chunk_length_s" in worker
 
     def test_falls_back_when_webgpu_is_missing(self):
         """아이폰·구형 기기는 WebGPU 가 없을 수 있다."""
-        worker = (WEB_DIR / "worker.js").read_text(encoding="utf-8")
+        worker = (WEB_DIR / "engine.js").read_text(encoding="utf-8")
         assert "wasm" in worker and "webgpu" in worker
 
     def test_supports_iphone_recording_format(self):
