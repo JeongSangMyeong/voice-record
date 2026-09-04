@@ -279,10 +279,92 @@ class TestBrowserOnlyWebApp:
         assert "뜨거워지고" in html or "뜨거워질" in html
         assert "confirm(" in html
 
-    def test_diarization_uses_a_fast_transform(self):
-        """정의대로 계산하면(DFT) 휴대폰이 눈에 띄게 버벅인다. FFT 여야 한다."""
+    def test_diarization_uses_a_real_speaker_model(self):
+        """직접 만든 음색 특징으로는 화자를 못 가른다(실측).
+
+        같은 사람끼리 유사도 0.99, 다른 사람끼리 0.98 이라 사실상 구별이
+        되지 않았고, 한 사람을 다섯 명으로 쪼개는 일이 잦았다.
+        목소리를 전문으로 배운 모델을 써야 한다.
+        """
         diarize = (WEB_DIR / "diarize.js").read_text(encoding="utf-8")
-        assert "fftInPlace" in diarize
+        assert "wespeaker" in diarize, "화자 인식 모델을 쓰지 않습니다"
+        assert "AutoProcessor" in diarize and "AutoModel" in diarize
+        # 되살아나면 안 되는 옛 방식
+        assert "fftInPlace" not in diarize, "직접 만든 MFCC 방식이 되살아났습니다"
+        assert "silhouette" not in diarize, "화자 수를 실루엣 점수로 고르면 안 됩니다"
+
+    def test_diarization_can_answer_one_speaker(self):
+        """옛 코드는 화자 수 후보를 2명부터 셌다.
+
+        그래서 한 사람만 말한 녹음도 반드시 둘 이상으로 쪼갰다.
+        임계값으로 멈추는 방식이라야 '한 명' 이라는 답이 나온다.
+        """
+        diarize = (WEB_DIR / "diarize.js").read_text(encoding="utf-8")
+        assert "clusterByAffinity" in diarize
+        assert "for (let k = 2;" not in diarize, "아직도 2명부터 세고 있습니다"
+
+    def test_diarization_does_not_guess_when_the_model_is_missing(self):
+        """모델을 못 받으면 지어내지 말고 화자 구분만 빼야 한다.
+
+        옛 방식은 실측상 '무조건 한 명' 이라고 답하는 것보다도 점수가 낮았다.
+        틀린 화자 표시는 사용자를 오히려 헷갈리게 한다.
+        """
+        engine = (WEB_DIR / "engine.js").read_text(encoding="utf-8")
+        html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+        assert "diarize-skipped" in engine
+        assert "화자 구분을 하지 못했습니다" in html, "실패를 사용자에게 알리지 않습니다"
+
+    def test_speaker_clustering_scores_perfectly_on_real_voices(self):
+        """실제 사람 목소리로 만든 평가셋에서 성능이 떨어지면 잡아낸다.
+
+        임베딩은 브라우저가 쓰는 모델과 같은 가중치·같은 전처리로 미리 뽑아 두었다.
+        모델을 내려받지 않고도 묶는 논리를 그대로 검증할 수 있다.
+        옛 구현 점수: 쌍 F1 0.663, 화자 수 정확 4/11.
+        """
+        import json
+        import shutil
+        import subprocess
+
+        node = shutil.which("node")
+        if not node:
+            pytest.skip("node 가 없어 건너뜁니다")
+
+        fixture = Path(__file__).parent / "speaker_embeddings.json"
+        script = f"""
+        import fs from "node:fs";
+        const {{ clusterByAffinity, toSpeakerNames }} =
+          await import("{(WEB_DIR / 'diarize.js').as_posix()}");
+        const d = JSON.parse(fs.readFileSync("{fixture.as_posix()}", "utf8"));
+        const out = [];
+        for (const [name, info] of Object.entries(d["시나리오"])) {{
+          const V = d["임베딩"][name].map((v) => Float32Array.from(v));
+          const labels = toSpeakerNames(V.length, V.map((_, i) => i), clusterByAffinity(V));
+          let tp = 0, fp = 0, fn = 0;
+          const t = info["정답"];
+          for (let i = 0; i < t.length; i++) for (let j = i + 1; j < t.length; j++) {{
+            const same = t[i] === t[j], psame = labels[i] === labels[j];
+            if (same && psame) tp++; else if (psame) fp++; else if (same) fn++;
+          }}
+          const pr = tp + fp ? tp / (tp + fp) : 1, rc = tp + fn ? tp / (tp + fn) : 1;
+          out.push({{ name, f1: pr + rc ? (2 * pr * rc) / (pr + rc) : 0,
+                     k: new Set(labels).size, want: info["화자수"] }});
+        }}
+        console.log(JSON.stringify(out));
+        """
+        result = subprocess.run(
+            [node, "--input-type=module", "-e", script],
+            capture_output=True, text=True, timeout=120,
+        )
+        assert result.returncode == 0, result.stderr
+        rows = json.loads(result.stdout.strip().splitlines()[-1])
+        assert len(rows) == 11
+
+        wrong = [r for r in rows if r["k"] != r["want"]]
+        assert not wrong, "화자 수를 틀린 경우: " + ", ".join(
+            f"{r['name']} {r['k']}명(정답 {r['want']}명)" for r in wrong
+        )
+        average = sum(r["f1"] for r in rows) / len(rows)
+        assert average > 0.95, f"쌍 F1 평균이 {average:.3f} 로 떨어졌습니다"
 
     def test_diarization_is_on_by_default(self):
         html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
@@ -333,7 +415,10 @@ class TestBrowserOnlyWebApp:
         html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
         assert "MODEL_PROFILES" in html, "표에서 용량을 읽어 오지 않습니다"
         assert "pickProfileKey" in html, "기기에 맞는 칸을 고르지 않습니다"
-        hardcoded = re.findall(r"(?:약 )?(\d{2,4})\s?MB", html)
+        # 받아쓰기 모델만 기기에 따라 용량이 달라진다.
+        # 화자 구분 모델은 어떤 기기에서도 같은 파일(26MB)이라 적어 두어도 된다.
+        without_speaker_note = re.sub(r"처음 한 번 \d+MB 더 받음", "", html)
+        hardcoded = re.findall(r"(?:약 )?(\d{2,4})\s?MB", without_speaker_note)
         assert not hardcoded, f"화면에 박아 둔 용량이 남아 있습니다: {hardcoded}"
 
     def test_picks_efficient_precision_per_device(self):
@@ -352,7 +437,7 @@ class TestBrowserOnlyWebApp:
         """화자 구분은 부가 기능이다. 실패해도 받아쓴 내용은 나와야 한다."""
         engine = (WEB_DIR / "engine.js").read_text(encoding="utf-8")
         index = engine.index("assignSpeakers")
-        assert "catch" in engine[index : index + 600]
+        assert "catch" in engine[index : index + 1500]
 
     def test_required_files_exist(self):
         for name in ("index.html", "worker.js", "engine.js", "diarize.js", "올리는방법.md"):

@@ -15,6 +15,7 @@ const LIB_URLS = [
 ];
 
 let pipelineFn = null;
+let libRef = null;   // 화자 구분에서도 같은 라이브러리를 쓴다
 let transcriber = null;
 let loadedKey = null;
 
@@ -54,6 +55,7 @@ async function loadLibrary() {
     throw new Error("라이브러리 형식이 예상과 다릅니다. 잠시 후 다시 시도해 주세요.");
   }
   pipelineFn = lib.pipeline;
+  libRef = lib;
   lib.env.allowLocalModels = false; // 원격 모델만 쓴다
   tuneThreads(lib.env);
 }
@@ -381,11 +383,24 @@ export async function runTranscription(request, onEvent) {
     onEvent({ type: "phase", phase: "diarizing" });
     try {
       const { assignSpeakers } = await import("./diarize.js");
-      const labels = assignSpeakers(audio, chunks, sampleRate);
+      const labels = await assignSpeakers(audio, chunks, sampleRate, {
+        transformers: libRef,
+        device,
+        // 목소리 모델(약 26MB)도 처음 한 번은 내려받는다. 같은 진행률 막대를 쓴다.
+        onProgress: (item) => {
+          if (item.status === "progress" && item.total) {
+            onEvent({ type: "download", file: item.file, loaded: item.loaded, total: item.total });
+          } else if (item.status === "done") {
+            onEvent({ type: "download-done", file: item.file });
+          }
+        },
+        onSegment: (done, total) => onEvent({ type: "diarize-progress", done, total }),
+      });
       chunks = chunks.map((c, i) => ({ ...c, speaker: labels[i] }));
       speakers = new Set(labels).size;
     } catch (error) {
-      // 화자 구분은 부가 기능이다. 실패해도 받아쓰기 결과는 그대로 준다.
+      // 화자 구분은 부가 기능이다. 실패하면 잘못 추측하지 않고 그냥 뺀다.
+      // 받아쓰기 결과는 그대로 준다.
       onEvent({ type: "phase", phase: "diarize-skipped" });
     }
   }

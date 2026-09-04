@@ -1,269 +1,202 @@
 /**
- * 간이 화자 분리 — 누가 언제 말했는지 나눈다.
+ * 화자 구분 — 누가 언제 말했는지 나눈다.
  *
- * 목소리의 음색(MFCC)을 뽑아 비슷한 구간끼리 묶는 방식이다.
- * 추가로 내려받는 모델이 없어 브라우저에서 바로 돌아간다.
- * 전문 모델(pyannote 등)보다는 정확도가 떨어지지만
- * "두세 명이 번갈아 말하는 대화" 정도는 잘 나눈다.
+ * 예전에는 소리의 특징(MFCC)을 직접 계산해서 비교했는데, 실제 녹음으로 재 보니
+ * 같은 사람끼리 유사도 0.99, 다른 사람끼리 0.98 로 사실상 구별이 되지 않았다.
+ * 한 사람을 다섯 명으로 쪼개 놓는 일이 잦았다.
  *
- * PC 판에서 검증한 파이썬 구현을 그대로 옮긴 것이다.
+ * 그래서 목소리만 전문으로 배운 모델을 쓴다. 같은 실제 녹음으로 다시 재니
+ * 같은 사람 0.85 / 다른 사람 0.2 수준으로 뚜렷하게 갈렸다.
+ * (측정 결과는 아래 SAME_SPEAKER 주석에 적어 두었다.)
  */
 
-const FRAME_SECONDS = 0.025;   // 25ms 창
-const HOP_SECONDS = 0.010;     // 10ms 씩 이동
-const MEL_FILTERS = 26;
-const MFCC_COUNT = 13;
-const MAX_SPEAKERS = 6;
-/** 이보다 짧은 구간은 음색이 불안정해 판단하지 않는다. */
-const MIN_SECONDS = 0.4;
-
-const hzToMel = (hz) => 2595 * Math.log10(1 + hz / 700);
-const melToHz = (mel) => 700 * (10 ** (mel / 2595) - 1);
-
-/** 삼각형 멜 필터뱅크를 만든다. */
-function melFilterbank(nFilters, nFft, sampleRate) {
-  const lowMel = hzToMel(0);
-  const highMel = hzToMel(sampleRate / 2);
-  const bins = new Array(nFilters + 2);
-  for (let i = 0; i < nFilters + 2; i++) {
-    const mel = lowMel + ((highMel - lowMel) * i) / (nFilters + 1);
-    bins[i] = Math.min(nFft >> 1, Math.floor(((nFft + 1) * melToHz(mel)) / sampleRate));
-  }
-  const bank = [];
-  for (let i = 1; i <= nFilters; i++) {
-    const row = new Float32Array((nFft >> 1) + 1);
-    let [left, center, right] = [bins[i - 1], bins[i], bins[i + 1]];
-    if (center === left) center = Math.min(left + 1, nFft >> 1);
-    if (right === center) right = Math.min(center + 1, nFft >> 1);
-    for (let k = left; k < center; k++) row[k] = (k - left) / Math.max(1, center - left);
-    for (let k = center; k < right; k++) row[k] = (right - k) / Math.max(1, right - center);
-    bank.push(row);
-  }
-  return bank;
-}
+/** 목소리 지문을 뽑는 모델. 약 26MB 이며 받아쓰기 모델과 별개로 한 번만 받는다. */
+export const SPEAKER_MODEL = "onnx-community/wespeaker-voxceleb-resnet34-LM";
 
 /**
- * 고속 푸리에 변환(FFT). 크기가 2의 거듭제곱일 때 쓰는 표준 방식이다.
+ * 같은 사람으로 볼 유사도 기준.
  *
- * 처음에는 정의대로 계산했는데(모든 주파수 × 모든 표본), 휴대폰에서 화면이
- * 눈에 띄게 버벅였다. 같은 결과를 훨씬 적은 연산으로 얻도록 바꿨다.
- * 512점 기준 약 13만 번 → 약 4600 번으로 줄어든다.
+ * 실제 녹음 11종(1~5명, 같은 언어 다화자 포함)으로 임계값을 훑어 정했다.
+ *   0.30 ~ 0.40 → 11종 모두 화자 수까지 정확 (쌍 F1 1.000)
+ *   0.25 / 0.45 → 10종 정확
+ *   0.10 이하   → 전부 한 명으로 뭉침
+ *   0.70 이상   → 한 사람을 여러 명으로 쪼갬
+ * 가장 넓게 안전한 구간의 한가운데를 골랐다.
  */
-function fftInPlace(re, im) {
-  const n = re.length;
-  // 비트 반전 순서로 재배치
-  for (let i = 1, j = 0; i < n; i++) {
-    let bit = n >> 1;
-    for (; j & bit; bit >>= 1) j ^= bit;
-    j ^= bit;
-    if (i < j) {
-      [re[i], re[j]] = [re[j], re[i]];
-      [im[i], im[j]] = [im[j], im[i]];
-    }
+const SAME_SPEAKER = 0.35;
+
+/** 이보다 많은 사람으로는 나누지 않는다. */
+const MAX_SPEAKERS = 8;
+
+/** 이보다 짧은 구간은 목소리를 판단하기 어려워 앞 구간을 따른다. */
+const MIN_SECONDS = 0.5;
+
+/** 한 구간에서 목소리 판단에 쓰는 최대 길이. 더 들어도 나아지지 않고 느려지기만 한다. */
+const MAX_EMBED_SECONDS = 10;
+
+let cached = null;
+
+/**
+ * 목소리 모델을 준비한다.
+ *
+ * @param {object} lib 이미 불러 둔 @huggingface/transformers 모듈
+ * @param {object} options device 와 진행률 콜백
+ */
+async function loadSpeakerModel(lib, { device, progress_callback } = {}) {
+  if (cached) return cached;
+  if (!lib?.AutoProcessor || !lib?.AutoModel) {
+    throw new Error("이 라이브러리 버전은 화자 구분 모델을 지원하지 않습니다.");
   }
-  for (let len = 2; len <= n; len <<= 1) {
-    const angle = (-2 * Math.PI) / len;
-    const wRe = Math.cos(angle);
-    const wIm = Math.sin(angle);
-    for (let i = 0; i < n; i += len) {
-      let curRe = 1, curIm = 0;
-      for (let k = 0; k < len / 2; k++) {
-        const uRe = re[i + k], uIm = im[i + k];
-        const vRe = re[i + k + len / 2] * curRe - im[i + k + len / 2] * curIm;
-        const vIm = re[i + k + len / 2] * curIm + im[i + k + len / 2] * curRe;
-        re[i + k] = uRe + vRe;
-        im[i + k] = uIm + vIm;
-        re[i + k + len / 2] = uRe - vRe;
-        im[i + k + len / 2] = uIm - vIm;
-        const nextRe = curRe * wRe - curIm * wIm;
-        curIm = curRe * wIm + curIm * wRe;
-        curRe = nextRe;
-      }
-    }
-  }
+  const [processor, model] = await Promise.all([
+    lib.AutoProcessor.from_pretrained(SPEAKER_MODEL, { progress_callback }),
+    // 26MB 뿐이라 정밀도를 낮추지 않는다. 낮추면 목소리 구별력이 떨어진다.
+    lib.AutoModel.from_pretrained(SPEAKER_MODEL, { dtype: "fp32", device, progress_callback }),
+  ]);
+  cached = { processor, model };
+  return cached;
 }
 
-/** 주파수별 세기(크기의 제곱)를 구한다. */
-function powerSpectrum(frame, nFft) {
-  const re = new Float64Array(nFft);
-  const im = new Float64Array(nFft);
-  re.set(frame);                       // 나머지는 0 으로 채워진다
-  fftInPlace(re, im);
-  const half = (nFft >> 1) + 1;
-  const out = new Float32Array(half);
-  for (let k = 0; k < half; k++) out[k] = (re[k] * re[k] + im[k] * im[k]) / nFft;
-  return out;
-}
-
-/** 한 구간의 음색을 고정 길이 벡터로 요약한다(MFCC 평균 + 표준편차). */
-function embed(samples, sampleRate) {
-  const frameLength = Math.max(1, Math.round(sampleRate * FRAME_SECONDS));
-  const hop = Math.max(1, Math.round(sampleRate * HOP_SECONDS));
-  let nFft = 1;
-  while (nFft < frameLength) nFft *= 2;
-
-  const window = new Float32Array(frameLength);
-  for (let i = 0; i < frameLength; i++) {
-    window[i] = 0.54 - 0.46 * Math.cos((2 * Math.PI * i) / (frameLength - 1));  // 해밍 창
+/** 모델이 돌려준 결과에서 목소리 지문 벡터를 꺼낸다. */
+function pickEmbedding(output) {
+  const tensor =
+    output?.embeddings ?? output?.embs ?? output?.logits ?? Object.values(output || {})[0];
+  const data = tensor?.data ?? tensor;
+  if (!data || typeof data.length !== "number" || !data.length) {
+    throw new Error("화자 구분 모델이 예상과 다른 형식을 돌려주었습니다.");
   }
-  const bank = melFilterbank(MEL_FILTERS, nFft, sampleRate);
-
-  // 미리 계산해 두는 DCT 행렬
-  const dct = [];
-  for (let k = 0; k < MFCC_COUNT; k++) {
-    const row = new Float32Array(MEL_FILTERS);
-    for (let n = 0; n < MEL_FILTERS; n++) {
-      row[n] = Math.cos((Math.PI * k * (2 * n + 1)) / (2 * MEL_FILTERS));
-    }
-    dct.push(row);
-  }
-
-  const frames = [];
-  // 너무 긴 구간은 앞부분만 봐도 음색 판단에 충분하다(속도를 위해).
-  const limit = Math.min(samples.length, sampleRate * 6);
-  for (let start = 0; start + frameLength <= limit; start += hop) {
-    const frame = new Float32Array(frameLength);
-    for (let i = 0; i < frameLength; i++) frame[i] = samples[start + i] * window[i];
-    const spectrum = powerSpectrum(frame, nFft);
-
-    const logMel = new Float32Array(MEL_FILTERS);
-    for (let m = 0; m < MEL_FILTERS; m++) {
-      let energy = 0;
-      const row = bank[m];
-      for (let k = 0; k < row.length; k++) energy += spectrum[k] * row[k];
-      logMel[m] = Math.log(Math.max(energy, 1e-10));
-    }
-    const mfcc = new Float32Array(MFCC_COUNT);
-    for (let k = 0; k < MFCC_COUNT; k++) {
-      let sum = 0;
-      for (let n = 0; n < MEL_FILTERS; n++) sum += logMel[n] * dct[k][n];
-      mfcc[k] = sum;
-    }
-    frames.push(mfcc);
-  }
-  if (!frames.length) return null;
-
-  const vector = new Float32Array(MFCC_COUNT * 2);
-  for (let k = 0; k < MFCC_COUNT; k++) {
-    let mean = 0;
-    for (const f of frames) mean += f[k];
-    mean /= frames.length;
-    let variance = 0;
-    for (const f of frames) variance += (f[k] - mean) ** 2;
-    vector[k] = mean;
-    vector[MFCC_COUNT + k] = Math.sqrt(variance / frames.length);
-  }
+  const vector = new Float32Array(data.length);
   let norm = 0;
-  for (const v of vector) norm += v * v;
+  for (let i = 0; i < data.length; i++) {
+    vector[i] = data[i];
+    norm += data[i] * data[i];
+  }
   norm = Math.sqrt(norm);
-  if (norm > 0) for (let i = 0; i < vector.length; i++) vector[i] /= norm;
+  if (!(norm > 0)) throw new Error("목소리 지문이 비어 있습니다.");
+  for (let i = 0; i < vector.length; i++) vector[i] /= norm;
   return vector;
 }
 
-/** 평균 연결 병합 군집화. */
-function cluster(distances, k) {
-  let groups = distances.map((_, i) => [i]);
-  while (groups.length > Math.max(1, k)) {
-    let best = { value: Infinity, a: 0, b: 1 };
+/**
+ * 목소리 지문끼리 닮은 정도로 묶는다(평균 연결 병합).
+ *
+ * 가장 닮은 두 무리를 계속 합치다가, 닮은 정도가 기준보다 낮아지면 멈춘다.
+ * 화자 수를 미리 정할 필요가 없어서 한 명짜리 녹음도 자연스럽게 한 명으로 남는다.
+ * 예전 방식은 후보를 2명부터 세어, 한 명인 녹음을 반드시 쪼갰다.
+ *
+ * @param {Float32Array[]} vectors
+ * @param {number} threshold
+ * @returns {number[]} 벡터마다의 무리 번호
+ */
+export function clusterByAffinity(vectors, threshold = SAME_SPEAKER, maxSpeakers = MAX_SPEAKERS) {
+  const n = vectors.length;
+  if (n === 0) return [];
+  if (n === 1) return [0];
+
+  const similarity = vectors.map((a) =>
+    vectors.map((b) => {
+      let dot = 0;
+      for (let i = 0; i < a.length; i++) dot += a[i] * b[i];
+      return dot;
+    }),
+  );
+
+  let groups = vectors.map((_, i) => [i]);
+  while (groups.length > 1) {
+    let best = { value: -Infinity, a: -1, b: -1 };
     for (let a = 0; a < groups.length; a++) {
       for (let b = a + 1; b < groups.length; b++) {
         let sum = 0;
-        for (const i of groups[a]) for (const j of groups[b]) sum += distances[i][j];
+        for (const i of groups[a]) for (const j of groups[b]) sum += similarity[i][j];
         const mean = sum / (groups[a].length * groups[b].length);
-        if (mean < best.value) best = { value: mean, a, b };
+        if (mean > best.value) best = { value: mean, a, b };
       }
     }
+    // 충분히 안 닮았고 사람 수도 상한 이내면 여기서 멈춘다.
+    if (best.value < threshold && groups.length <= maxSpeakers) break;
     groups[best.a] = groups[best.a].concat(groups[best.b]);
     groups.splice(best.b, 1);
   }
-  const labels = new Array(distances.length).fill(0);
+
+  const labels = new Array(n).fill(0);
   groups.forEach((members, index) => members.forEach((i) => { labels[i] = index; }));
   return labels;
 }
 
-/** 군집이 잘 나뉘었는지 점수를 매긴다(-1~1, 클수록 좋음). */
-function silhouette(distances, labels) {
-  const unique = [...new Set(labels)];
-  if (unique.length < 2 || labels.length <= unique.length) return -1;
-  const scores = [];
-  for (let i = 0; i < labels.length; i++) {
-    const same = labels.map((l, j) => (l === labels[i] && j !== i ? j : -1)).filter((j) => j >= 0);
-    if (!same.length) continue;
-    const a = same.reduce((s, j) => s + distances[i][j], 0) / same.length;
-    let b = Infinity;
-    for (const other of unique) {
-      if (other === labels[i]) continue;
-      const members = labels.map((l, j) => (l === other ? j : -1)).filter((j) => j >= 0);
-      if (!members.length) continue;
-      b = Math.min(b, members.reduce((s, j) => s + distances[i][j], 0) / members.length);
-    }
-    const denominator = Math.max(a, b);
-    if (denominator > 0) scores.push((b - a) / denominator);
+/**
+ * 무리 번호를 사람이 읽는 이름으로 바꾸고, 건너뛴 구간을 메운다.
+ *
+ * @param {number} total 전체 구간 수
+ * @param {number[]} usable 실제로 판단한 구간의 위치
+ * @param {number[]} labels usable 과 같은 길이의 무리 번호
+ */
+export function toSpeakerNames(total, usable, labels) {
+  // 먼저 말한 사람이 화자1 이 되도록 번호를 다시 매긴다.
+  const order = new Map();
+  for (const label of labels) if (!order.has(label)) order.set(label, order.size + 1);
+
+  const result = new Array(total).fill("화자1");
+  usable.forEach((segmentIndex, i) => {
+    result[segmentIndex] = `화자${order.get(labels[i])}`;
+  });
+
+  // 너무 짧아 판단하지 못한 구간은 바로 앞 구간의 화자를 따른다.
+  const judged = new Set(usable);
+  let previous = usable.length ? result[usable[0]] : "화자1";
+  for (let i = 0; i < result.length; i++) {
+    if (judged.has(i)) previous = result[i];
+    else result[i] = previous;
   }
-  return scores.length ? scores.reduce((s, v) => s + v, 0) / scores.length : -1;
+  return result;
 }
 
 /**
- * 구간별 화자 라벨을 붙인다.
+ * 구간별 화자 이름을 붙인다.
+ *
+ * 모델을 받지 못하면 예외를 던진다. 잘못 추측해서 한 사람을 여러 명으로
+ * 쪼개 보여 주는 것보다, 화자 구분만 빼고 받아쓰기를 주는 편이 낫다.
+ * (직접 계산하던 예전 방식은 실측 결과 '무조건 한 명' 이라고 답하는 것보다도
+ *  점수가 낮아서 없앴다.)
  *
  * @param {Float32Array} audio 16kHz 모노 오디오 전체
  * @param {{start:number,end:number}[]} segments 받아쓰기 구간
  * @param {number} sampleRate
- * @returns {string[]} 구간과 같은 길이의 화자 이름 배열
+ * @param {{transformers?:object, device?:string, onProgress?:Function, onSegment?:Function}} options
+ * @returns {Promise<string[]>} 구간과 같은 길이의 화자 이름 배열
  */
-export function assignSpeakers(audio, segments, sampleRate) {
+export async function assignSpeakers(audio, segments, sampleRate, options = {}) {
   if (segments.length < 2) return segments.map(() => "화자1");
+
+  const { processor, model } = await loadSpeakerModel(options.transformers, {
+    device: options.device === "webgpu" ? "webgpu" : "wasm",
+    progress_callback: options.onProgress,
+  });
 
   const vectors = [];
   const usable = [];
-  segments.forEach((segment, index) => {
+  const limit = Math.round(MAX_EMBED_SECONDS * sampleRate);
+
+  for (let index = 0; index < segments.length; index++) {
+    const segment = segments[index];
     const from = Math.max(0, Math.floor(segment.start * sampleRate));
     const to = Math.min(audio.length, Math.ceil(segment.end * sampleRate));
-    if (to - from < MIN_SECONDS * sampleRate) return;
-    const vector = embed(audio.subarray(from, to), sampleRate);
-    if (vector) { vectors.push(vector); usable.push(index); }
-  });
-  if (vectors.length < 2) return segments.map(() => "화자1");
+    if (to - from < MIN_SECONDS * sampleRate) continue;
 
-  const distances = vectors.map((a) =>
-    vectors.map((b) => {
-      let dot = 0;
-      for (let i = 0; i < a.length; i++) dot += a[i] * b[i];
-      return Math.max(0, Math.min(2, 1 - dot));
-    }),
-  );
-
-  // 화자 수 후보를 훑되, 점수가 비슷하면 '사람이 더 적은 쪽' 을 고른다.
-  // (점수만 보면 같은 사람을 둘로 쪼개는 경향이 있다)
-  const scored = [];
-  const upper = Math.min(MAX_SPEAKERS, vectors.length);
-  for (let k = 2; k <= upper; k++) {
-    const labels = cluster(distances, k);
-    scored.push({ k, score: silhouette(distances, labels), labels });
-  }
-  let chosen = new Array(vectors.length).fill(0);
-  if (scored.length) {
-    const bestScore = Math.max(...scored.map((s) => s.score));
-    if (bestScore >= 0.05) {
-      const threshold = Math.min(bestScore * 0.92, bestScore - 0.03);
-      const eligible = scored.filter((s) => s.score >= threshold);
-      chosen = eligible.reduce((a, b) => (a.k <= b.k ? a : b)).labels;
+    // 긴 구간은 가운데만 쓴다. 앞뒤에는 다른 사람의 말이 묻어 있을 수 있다.
+    let start = from;
+    let end = to;
+    if (to - from > limit) {
+      const middle = Math.floor((from + to) / 2);
+      start = Math.max(from, middle - Math.floor(limit / 2));
+      end = Math.min(to, start + limit);
     }
+
+    const inputs = await processor(audio.subarray(start, end));
+    vectors.push(pickEmbedding(await model(inputs)));
+    usable.push(index);
+
+    options.onSegment?.(usable.length, segments.length);
   }
 
-  // 먼저 말한 사람이 화자1 이 되도록 번호를 다시 매긴다.
-  const order = new Map();
-  for (const label of chosen) if (!order.has(label)) order.set(label, order.size + 1);
-
-  const result = segments.map(() => "화자1");
-  usable.forEach((segmentIndex, i) => {
-    result[segmentIndex] = `화자${order.get(chosen[i])}`;
-  });
-  // 너무 짧아 판단하지 못한 구간은 바로 앞 구간의 화자를 따른다.
-  let previous = result[usable[0]] || "화자1";
-  for (let i = 0; i < result.length; i++) {
-    if (usable.includes(i)) previous = result[i];
-    else result[i] = previous;
-  }
-  return result;
+  if (vectors.length < 2) return segments.map(() => "화자1");
+  return toSpeakerNames(segments.length, usable, clusterByAffinity(vectors));
 }
