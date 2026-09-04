@@ -102,18 +102,18 @@
       <div>
         <label class="f" for="model">받아쓰기 엔진</label>
         <select id="model">
-          <optgroup label="한국어 · 일본어 · 중국어 · 영어">
-            <option value="sensevoice-small" selected>✅ SenseVoice — 권장 (가장 정확하고 빠름)</option>
-          </optgroup>
-          <optgroup label="그 밖의 언어 (프랑스어·독일어·베트남어 등)">
-            <option value="onnx-community/whisper-large-v3-turbo">Whisper 큼 — 정확하지만 느림</option>
+          <optgroup label="정확하게 (모든 언어)">
+            <option value="onnx-community/whisper-large-v3-turbo" selected>✅ Whisper 큼 — 권장 (가장 정확)</option>
             <option value="onnx-community/whisper-small">Whisper 보통</option>
             <option value="onnx-community/whisper-base">Whisper 작음 — 빠름</option>
             <option value="onnx-community/whisper-tiny">Whisper 아주 작음 — 가장 빠름</option>
           </optgroup>
+          <optgroup label="빠르게 훑어보기 (한·중·일·영)">
+            <option value="sensevoice-small">SenseVoice — 아주 빠름, 대신 정확도 낮음</option>
+          </optgroup>
         </select>
         <div class="status" style="margin-top:6px">
-          한국어면 <b>맨 위 SenseVoice</b> 그대로 두세요. 처음 한 번만 받고 이후엔 저장됩니다.
+          제대로 받아쓰려면 <b>맨 위 Whisper 큼</b> 을 쓰세요. 처음 한 번만 받고 이후엔 저장됩니다.
         </div>
       </div>
     </div>
@@ -184,7 +184,7 @@ let cancelled = false;
 let workerFailed = false;      // 작업자가 한 번 실패하면 이후에는 바로 우회한다
 let mainThreadBusy = false;
 // 파일을 고칠 때마다 올린다. 브라우저가 예전 파일을 쓰지 않게 하는 용도.
-const APP_VERSION = "23";
+const APP_VERSION = "24";
 
 /* ---------- 보안 연결 확인 (마이크는 https 에서만 된다) ---------- */
 if (!window.isSecureContext) {
@@ -338,12 +338,13 @@ function updateModelHint() {
   if (sense) {
     const lang = $("lang").value;
     const known = SENSEVOICE_LANGS.includes(lang);
-    box.className = known ? "note info" : "note warn";
+    box.className = "note warn";
     box.innerHTML = known
-      ? `한국어에 가장 정확하고 가장 빠른 조합입니다${sizeNote}. ` +
-        "처음 한 번만 받고 그 뒤로는 저장됩니다."
+      ? `아주 빠른 대신 <b>정확도가 떨어집니다</b>${sizeNote}.<br />` +
+        "긴 문장에서 띄어쓰기와 단어가 자주 틀리고, <b>화자 구분도 잘 안 됩니다.</b><br />" +
+        "내용만 빠르게 훑어볼 때 쓰고, 제대로 받아쓰려면 <b>Whisper 큼</b> 을 쓰세요."
       : "이 엔진은 <b>한국어·영어·일본어·중국어·광둥어</b>만 압니다.<br />" +
-        "다른 언어는 위에서 <b>그 밖의 언어</b> 로 바꿔 주세요.";
+        "다른 언어는 위쪽 <b>Whisper</b> 로 바꿔 주세요.";
     return;
   }
   box.className = "note info";

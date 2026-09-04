@@ -648,9 +648,27 @@ class TestBrowserOnlyWebApp:
         assert "SenseVoice" in select, "엔진 이름이 화면에 없습니다"
         assert "Whisper" in select, "엔진 이름이 화면에 없습니다"
         assert "optgroup" in select, "어느 것이 어느 언어용인지 묶여 있지 않습니다"
-        assert 'value="sensevoice-small" selected' in select, "권장 엔진이 기본값이 아닙니다"
-        # 기본값과 어긋나는 옛 안내가 남아 있으면 안 된다
+        # 실제 회의 녹음으로 재 보니 Whisper 가 확실히 정확했다. 그쪽이 기본값이어야 한다.
+        assert 'value="onnx-community/whisper-large-v3-turbo" selected' in select, (
+            "가장 정확한 엔진이 기본값이 아닙니다"
+        )
         assert "한국어는 <b>가장 정확</b>을 권합니다" not in html, "옛 안내가 남아 있습니다"
+
+    def test_sensevoice_is_honestly_labelled(self):
+        """SenseVoice 는 빠르지만 정확도가 낮다. 그대로 적어야 한다.
+
+        실제 2분짜리 한국어 회의 녹음으로 비교한 결과다.
+          SenseVoice  '워그샵', '다 다음 주', '해외영을', 띄어쓰기 무너짐, 화자 구분 안 됨
+          Whisper     '업크샵', '다음주에', '해외영업을', 문장부호 있음, 화자 3명 구분
+        글자를 한 번에 뱉는 방식(CTC)이라 문맥으로 단어 경계를 잡지 못하는 한계다.
+        설정(언어 지정·문장부호)을 바꿔도 같은 오류가 나는 것을 확인했다.
+        """
+        html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+        select = html[html.index('<select id="model">') : html.index("</select>", html.index('<select id="model">'))]
+        sense = [line for line in select.splitlines() if "sensevoice-small" in line]
+        assert sense, "SenseVoice 선택지가 없습니다"
+        assert "정확도 낮음" in sense[0], "정확도가 낮다는 사실을 적지 않았습니다"
+        assert "화자 구분도 잘 안 됩니다" in html, "화자 구분이 약하다는 안내가 없습니다"
 
     def test_onnx_engine_is_served_from_our_own_site(self):
         """CDN 주소로 불러오면 브라우저가 작업자를 못 만들어 통째로 죽는다.
