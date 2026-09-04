@@ -135,6 +135,109 @@ async function getTranscriber(model, onEvent) {
   return { asr: transcriber, device };
 }
 
+/** Whisper 가 한 번에 볼 수 있는 최대 길이(초). 이보다 길게 넣으면 잘린다. */
+const WINDOW_SECONDS = 28;
+/** 말이 시작·끝나는 부분이 잘리지 않도록 앞뒤로 두는 여유(초). */
+const PAD_SECONDS = 0.4;
+/** 이만큼 조용하면 문장이 끊긴 것으로 본다(초). */
+const GAP_SECONDS = 0.6;
+
+/**
+ * 소리를 '말이 있는 구간' 단위로 잘라 창 목록을 만든다.
+ *
+ * 통화 녹음은 조용한 부분이 많은데, 그 부분까지 모델에 넣으면
+ * 시간만 쓰고 얻는 게 없다. 말이 있는 곳만 골라 30초 이하로 묶는다.
+ */
+export function splitIntoWindows(audio, sampleRate) {
+  const frame = Math.max(1, Math.round(sampleRate * 0.02));   // 20ms
+  const totalSeconds = audio.length / sampleRate;
+  const frameCount = Math.floor(audio.length / frame);
+  if (frameCount === 0) return toWindows([{ start: 0, end: totalSeconds }], audio, sampleRate);
+
+  // 프레임별 소리 크기
+  const energy = new Float32Array(frameCount);
+  for (let f = 0; f < frameCount; f++) {
+    let sum = 0;
+    const base = f * frame;
+    for (let i = 0; i < frame; i++) sum += audio[base + i] * audio[base + i];
+    energy[f] = Math.sqrt(sum / frame);
+  }
+
+  // 기준값은 녹음마다 다르므로 이 녹음 안에서 정한다.
+  const sorted = Float32Array.from(energy).sort();
+  const quiet = sorted[Math.floor(sorted.length * 0.2)];    // 조용한 축
+  const loud = sorted[Math.floor(sorted.length * 0.95)];    // 시끄러운 축
+  const threshold = Math.max(quiet * 2.5, loud * 0.06, 1e-4);
+
+  // 말이 있는 구간 찾기
+  const gapFrames = Math.round(GAP_SECONDS / 0.02);
+  const spans = [];
+  let start = -1;
+  let quietRun = 0;
+  for (let f = 0; f < frameCount; f++) {
+    if (energy[f] > threshold) {
+      if (start < 0) start = f;
+      quietRun = 0;
+    } else if (start >= 0 && ++quietRun >= gapFrames) {
+      spans.push([start, f - quietRun + 1]);
+      start = -1;
+      quietRun = 0;
+    }
+  }
+  if (start >= 0) spans.push([start, frameCount]);
+
+  // 쉬지 않고 계속 말하면 조용한 구간이 없어 아무것도 못 찾는다.
+  // 그때는 전체를 말하는 구간으로 본다(예전에는 여기서 통째로 반환하는 바람에
+  // 30초 제한이 걸리지 않아 뒷부분이 통째로 사라졌다).
+  const ranges = spans.length
+    ? spans.map(([a, b]) => ({ start: (a * frame) / sampleRate, end: (b * frame) / sampleRate }))
+    : [{ start: 0, end: totalSeconds }];
+
+  return toWindows(ranges, audio, sampleRate);
+}
+
+/**
+ * 말하는 구간 목록을 실제로 모델에 넣을 창 목록으로 바꾼다.
+ *
+ * 어떤 경우에도 한 창이 WINDOW_SECONDS 를 넘지 않는 것이 이 함수의 약속이다.
+ * 넘으면 Whisper 가 앞부분만 보고 나머지를 조용히 버린다.
+ */
+function toWindows(ranges, audio, sampleRate) {
+  const totalSeconds = audio.length / sampleRate;
+
+  // 길게 이어지는 구간은 여러 조각으로 쪼갠다.
+  const pieces = [];
+  for (const range of ranges) {
+    let from = range.start;
+    while (range.end - from > WINDOW_SECONDS) {
+      pieces.push({ start: from, end: from + WINDOW_SECONDS });
+      from += WINDOW_SECONDS;
+    }
+    if (range.end > from) pieces.push({ start: from, end: range.end });
+  }
+  if (!pieces.length) pieces.push({ start: 0, end: Math.min(totalSeconds, WINDOW_SECONDS) });
+
+  // 짧은 조각들은 제한을 넘지 않는 선에서 합쳐 호출 횟수를 줄인다.
+  const merged = [];
+  for (const piece of pieces) {
+    const last = merged[merged.length - 1];
+    if (last && piece.end - last.start <= WINDOW_SECONDS) last.end = piece.end;
+    else merged.push({ ...piece });
+  }
+
+  return merged.map((w) => {
+    // 여유를 붙이되, 붙인 뒤에도 제한을 넘지 않게 한다.
+    const start = Math.max(0, w.start - PAD_SECONDS);
+    const end = Math.min(totalSeconds, w.end + PAD_SECONDS, start + WINDOW_SECONDS + PAD_SECONDS);
+    return {
+      start,
+      end,
+      from: Math.floor(start * sampleRate),
+      to: Math.min(audio.length, Math.ceil(end * sampleRate)),
+    };
+  });
+}
+
 /**
  * 오디오를 받아쓴다.
  *
@@ -150,14 +253,48 @@ export async function runTranscription(request, onEvent) {
 
   onEvent({ type: "phase", phase: "transcribing" });
   const started = (globalThis.performance || Date).now();
-  const result = await asr(audio, {
-    language: language === "auto" ? null : language,
-    task: "transcribe",
-    return_timestamps: true,
-    // 30초보다 긴 소리는 잘라서 처리해야 한다(Whisper 는 한 번에 30초까지만 본다).
-    chunk_length_s: 30,
-    stride_length_s: 5,
+
+  // 라이브러리에 통째로 맡기면 내부에서 30초씩 잘라 돌리는데 진행 상황을
+  // 전혀 알려 주지 않는다. 직접 잘라서 돌리면 진행률을 보여줄 수 있고,
+  // 말이 없는 구간을 아예 건너뛸 수 있어 통화 녹음에서 특히 빨라진다.
+  const windows = splitIntoWindows(audio, sampleRate);
+  const speechSeconds = windows.reduce((sum, w) => sum + (w.end - w.start), 0);
+  onEvent({
+    type: "plan",
+    windows: windows.length,
+    speechSeconds,
+    totalSeconds: audio.length / sampleRate,
   });
+
+  const collected = [];
+  let text = "";
+  for (let i = 0; i < windows.length; i++) {
+    const w = windows[i];
+    const piece = await asr(audio.subarray(w.from, w.to), {
+      language: language === "auto" ? null : language,
+      task: "transcribe",
+      return_timestamps: true,
+      chunk_length_s: 0,   // 창이 이미 30초 이하라 추가로 자를 필요가 없다
+    });
+    text += (text ? " " : "") + (piece.text || "").trim();
+    for (const c of piece.chunks || []) {
+      collected.push({
+        start: (c.timestamp?.[0] ?? 0) + w.start,   // 원본 기준 시각으로 되돌린다
+        end: (c.timestamp?.[1] ?? 0) + w.start,
+        text: (c.text || "").trim(),
+      });
+    }
+    const done = i + 1;
+    const spent = ((globalThis.performance || Date).now() - started) / 1000;
+    onEvent({
+      type: "progress",
+      done,
+      total: windows.length,
+      elapsed: spent,
+      remaining: done > 0 ? (spent / done) * (windows.length - done) : null,
+    });
+  }
+  const result = { text, chunks: collected };
   const elapsed = ((globalThis.performance || Date).now() - started) / 1000;
 
   let chunks = (result.chunks || [])

@@ -142,6 +142,34 @@ class TestBrowserOnlyWebApp:
     업로드 코드가 실수로 들어오면 그 약속이 깨지므로 검사한다.
     """
 
+    def test_splits_audio_itself_to_show_real_progress(self):
+        """라이브러리에 통째로 맡기면 내부에서 30초씩 자르는데 진행을 알려 주지 않는다.
+
+        5분 넘게 진행률이 55% 에 멈춰 있어 멈춘 것처럼 보였다.
+        직접 잘라서 돌리면 구간별 진행과 남은 시간을 보여 줄 수 있고,
+        조용한 구간을 건너뛰어 실제로 빨라진다.
+        """
+        engine = (WEB_DIR / "engine.js").read_text(encoding="utf-8")
+        html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+        assert "splitIntoWindows" in engine
+        assert 'type: "progress"' in engine
+        assert "남음" in html          # 남은 시간 표시
+
+    def test_never_exceeds_the_thirty_second_limit(self):
+        """Whisper 는 한 번에 30초까지만 본다. 넘기면 뒷부분을 조용히 버린다.
+
+        쉬지 않고 말하는 녹음에서 '말하는 구간' 을 하나도 못 찾아
+        전체를 한 창으로 반환하던 경로가 있었다(3분 녹음에서 2분 30초 유실).
+        어떤 경로로 가든 toWindows 를 거치도록 고쳤다.
+        """
+        engine = (WEB_DIR / "engine.js").read_text(encoding="utf-8")
+        assert "function toWindows" in engine
+        # 제한을 우회하는 조기 반환이 없어야 한다
+        body = engine[engine.index("export function splitIntoWindows") : engine.index("function toWindows")]
+        for line in body.splitlines():
+            if line.strip().startswith("return "):
+                assert "toWindows" in line, f"toWindows 를 거치지 않는 반환: {line.strip()}"
+
     def test_every_requested_model_file_actually_exists(self):
         """모델마다 올라와 있는 파일이 다르다.
 
