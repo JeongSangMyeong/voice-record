@@ -326,13 +326,16 @@ function toWindows(ranges, audio, sampleRate, maxSeconds = WINDOW_SECONDS) {
 
 /* ---------- SenseVoice (한/중/일/영/광둥어 전용 엔진) ---------- */
 
-/** onnxruntime-web. 이 모델은 정수 연산이라 CPU 쪽이 맞아 WASM 판을 쓴다. */
-const ORT_VERSION = "1.20.1";
-const ORT_URLS = [
-  `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_VERSION}/dist/ort.bundle.min.mjs`,
-  `https://unpkg.com/onnxruntime-web@${ORT_VERSION}/dist/ort.bundle.min.mjs`,
-];
-const ORT_WASM_BASE = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_VERSION}/dist/`;
+/**
+ * onnxruntime-web. 이 모델은 정수 연산이라 CPU 쪽이 맞아 WASM 판을 쓴다.
+ *
+ * 반드시 우리 사이트에 직접 두고 써야 한다. CDN 주소로 불러오면
+ * 브라우저가 그 스크립트로 작업자(Worker)를 만들지 못하게 막아
+ * "SecurityError: Failed to construct 'Worker'" 로 죽는다(실제로 겪었다).
+ * CPU 를 여러 개 쓰려면 작업자가 필요하므로 피할 수 없는 조건이다.
+ */
+const ORT_DIR = "./ort/";
+const ORT_URL = `${ORT_DIR}ort.bundle.min.mjs`;
 
 let senseVoice = null;
 
@@ -377,18 +380,16 @@ async function fetchCached(url, onEvent, label) {
 async function loadSenseVoice(onEvent) {
   if (senseVoice) return senseVoice;
 
-  let ort = null;
-  let lastError = null;
-  for (const url of ORT_URLS) {
-    try { ort = await import(/* @vite-ignore */ url); break; } catch (error) { lastError = error; }
-  }
-  if (!ort) {
+  let ort;
+  try {
+    ort = await import(/* @vite-ignore */ new URL(ORT_URL, import.meta.url).href);
+  } catch (error) {
     throw new Error(
-      "음성인식 엔진을 불러오지 못했습니다.\n인터넷 연결을 확인해 주세요.\n" +
-        `(${lastError?.message || lastError})`,
+      "음성인식 엔진을 불러오지 못했습니다.\n페이지를 새로고침해 주세요.\n" +
+        `(${error?.message || error})`,
     );
   }
-  ort.env.wasm.wasmPaths = ORT_WASM_BASE;
+  ort.env.wasm.wasmPaths = new URL(ORT_DIR, import.meta.url).href;
   // 헤더가 붙어 있을 때만 CPU 를 여러 개 쓸 수 있다(coi-serviceworker.js 참고).
   ort.env.wasm.numThreads = currentThreads();
 
@@ -424,6 +425,74 @@ export const SENSEVOICE_SIZE_MB = 239;
 /** SenseVoice 용 구간 길이(초). Whisper 보다 짧게 잡는다(위 설명 참고). */
 const SENSEVOICE_WINDOW_SECONDS = 12;
 
+/**
+ * 소리 전체를 빠짐없이 덮는 구간으로 나눈다. 경계는 조용한 곳 한가운데로 잡는다.
+ *
+ * Whisper 쪽에서 쓰는 방식(조용한 부분을 아예 버리는 것)을 SenseVoice 에 쓰면
+ * 말끝이 잘려 결과가 나빠진다. 실측으로 확인했다.
+ *   파일 통째로        조금만 생각을 하면서 살면 훨씬 편할 거야.   (정확)
+ *   무음을 버리고 자름  조 금만 생각 을 하 면서 살 면 훨씬 편할 거야.  (띄어쓰기 무너짐)
+ * SenseVoice 는 실시간 대비 수십 배로 빨라, 조용한 부분을 건너뛰어 얻는 이득보다
+ * 말이 잘리는 손해가 크다.
+ */
+export function tileAtPauses(audio, sampleRate, maxSeconds = SENSEVOICE_WINDOW_SECONDS) {
+  const totalSeconds = audio.length / sampleRate;
+  if (totalSeconds <= maxSeconds) {
+    return [{ start: 0, end: totalSeconds, from: 0, to: audio.length }];
+  }
+
+  // 짧게 끊어 소리 크기를 재고, 조용한 구간을 찾는다.
+  const frame = Math.max(1, Math.round(sampleRate * 0.02));
+  const frames = Math.floor(audio.length / frame);
+  const energy = new Float32Array(frames);
+  let loudest = 0;
+  for (let f = 0; f < frames; f++) {
+    let sum = 0;
+    for (let i = f * frame; i < (f + 1) * frame; i++) sum += audio[i] * audio[i];
+    energy[f] = Math.sqrt(sum / frame);
+    if (energy[f] > loudest) loudest = energy[f];
+  }
+  const quiet = loudest * 0.06;
+
+  // 조용한 구간의 한가운데 위치(초)를 모아 둔다.
+  const pauses = [];
+  let run = -1;
+  for (let f = 0; f <= frames; f++) {
+    const isQuiet = f < frames && energy[f] < quiet;
+    if (isQuiet && run < 0) run = f;
+    else if (!isQuiet && run >= 0) {
+      if ((f - run) * frame >= sampleRate * 0.2) {
+        pauses.push((((run + f) / 2) * frame) / sampleRate);
+      }
+      run = -1;
+    }
+  }
+
+  const windows = [];
+  let start = 0;
+  const minSeconds = Math.min(3, maxSeconds / 2);
+  while (start < totalSeconds - 0.05) {
+    let end = Math.min(totalSeconds, start + maxSeconds);
+    if (end < totalSeconds) {
+      // 상한 안에서 가장 늦은 '쉬는 자리' 를 경계로 삼는다. 없으면 상한 그대로.
+      let latest = -1;
+      for (const pause of pauses) {
+        if (pause > start + minSeconds && pause <= end && pause > latest) latest = pause;
+      }
+      if (latest > 0) end = latest;
+    }
+    if (end <= start) end = Math.min(totalSeconds, start + maxSeconds);
+    windows.push({
+      start,
+      end,
+      from: Math.floor(start * sampleRate),
+      to: Math.min(audio.length, Math.ceil(end * sampleRate)),
+    });
+    start = end;
+  }
+  return windows;
+}
+
 async function runSenseVoice(request, onEvent) {
   const { audio, language, sampleRate } = request;
 
@@ -436,7 +505,8 @@ async function runSenseVoice(request, onEvent) {
 
   // SenseVoice 는 글자별 시각을 주지 않는다. 구간을 짧게 잡아야 화자 구분과
   // 시각 표시가 뭉개지지 않는다. 엔진이 빨라서 호출이 늘어도 부담이 적다.
-  const windows = splitIntoWindows(audio, sampleRate, SENSEVOICE_WINDOW_SECONDS);
+  // 조용한 부분을 버리지 않고 전체를 덮는다(위 tileAtPauses 설명 참고).
+  const windows = tileAtPauses(audio, sampleRate, SENSEVOICE_WINDOW_SECONDS);
   onEvent({
     type: "plan",
     windows: windows.length,

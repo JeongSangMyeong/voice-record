@@ -622,7 +622,7 @@ class TestBrowserOnlyWebApp:
         match = re.search(r"SENSEVOICE_WINDOW_SECONDS = (\d+)", engine)
         assert match, "SenseVoice 용 구간 길이를 찾지 못했습니다"
         assert int(match.group(1)) <= 15, "구간이 길어 화자 구분이 뭉개집니다"
-        assert "splitIntoWindows(audio, sampleRate, SENSEVOICE_WINDOW_SECONDS)" in engine
+        assert "tileAtPauses(audio, sampleRate, SENSEVOICE_WINDOW_SECONDS)" in engine
 
     def test_diarization_works_with_sensevoice_too(self):
         """SenseVoice 경로에서는 화자 구분용 라이브러리를 아직 안 불러온 상태다.
@@ -651,6 +651,86 @@ class TestBrowserOnlyWebApp:
         assert 'value="sensevoice-small" selected' in select, "권장 엔진이 기본값이 아닙니다"
         # 기본값과 어긋나는 옛 안내가 남아 있으면 안 된다
         assert "한국어는 <b>가장 정확</b>을 권합니다" not in html, "옛 안내가 남아 있습니다"
+
+    def test_onnx_engine_is_served_from_our_own_site(self):
+        """CDN 주소로 불러오면 브라우저가 작업자를 못 만들어 통째로 죽는다.
+
+        실제 오류: SecurityError: Failed to construct 'Worker': Script at
+        'https://cdn.jsdelivr.net/.../ort.bundle.min.mjs' cannot be accessed
+        from origin 'https://jeongsangmyeong.github.io'.
+        CPU 를 여러 개 쓰려면 작업자가 필요하므로 같은 사이트에 두어야 한다.
+        """
+        engine = (WEB_DIR / "engine.js").read_text(encoding="utf-8")
+        block = engine[engine.index("const ORT_DIR") : engine.index("let senseVoice")]
+        assert "cdn.jsdelivr.net" not in block and "unpkg.com" not in block, (
+            "onnxruntime 을 CDN 에서 불러오면 작업자를 만들지 못해 죽습니다"
+        )
+        assert 'const ORT_DIR = "./ort/"' in engine
+
+        root = WEB_DIR.parent.parent.parent
+        for name in ("ort.bundle.min.mjs", "ort-wasm-simd-threaded.mjs",
+                     "ort-wasm-simd-threaded.wasm"):
+            assert (root / "ort" / name).exists(), f"엔진 파일이 없습니다: ort/{name}"
+
+    def test_sensevoice_windows_cover_everything(self):
+        """조용한 부분을 버리고 자르면 말끝이 잘려 결과가 나빠진다.
+
+        실측: 파일 통째로 넣으면 '조금만 생각을 하면서 살면 훨씬 편할 거야.' 인데
+        무음을 버리고 자르면 '조 금만 생각 을 하 면서 살 면 훨씬 편할 거야.' 가 된다.
+        SenseVoice 용 구간은 소리 전체를 빠짐없이 덮어야 한다.
+        """
+        node = shutil.which("node")
+        if not node:
+            pytest.skip("node 가 없어 건너뜁니다")
+        script = f"""
+        const {{ tileAtPauses }} = await import("{(WEB_DIR / 'engine.js').as_posix()}");
+        const sr = 16000;
+        const make = (seconds, speaking) => {{
+          const a = new Float32Array(sr * seconds);
+          for (let i = 0; i < a.length; i++) {{
+            const t = i / sr;
+            if (speaking(t)) a[i] = Math.sin(i * 0.05) * 0.3;
+          }}
+          return a;
+        }};
+        const cases = [
+          ["짧음", make(5, () => true)],
+          ["쉼표 있는 긴 소리", make(90, (t) => t % 7 < 5)],
+          ["끊김 없는 긴 소리", make(90, () => true)],
+          ["거의 무음", make(40, (t) => t > 39.5)],
+        ];
+        const out = [];
+        for (const [name, audio] of cases) {{
+          for (const max of [12, 28]) {{
+            const w = tileAtPauses(audio, sr, max);
+            const total = audio.length / sr;
+            const covered = w.reduce((s, x) => s + (x.end - x.start), 0);
+            const gap = w.slice(1).some((x, i) => Math.abs(x.start - w[i].end) > 1e-6);
+            out.push({{ name, max, windows: w.length,
+              coverGap: Math.abs(covered - total),
+              gap, longest: Math.max(...w.map((x) => x.end - x.start)) }});
+          }}
+        }}
+        console.log(JSON.stringify(out));
+        """
+        result = subprocess.run(
+            [node, "--input-type=module", "-e", script],
+            capture_output=True, text=True, timeout=120,
+        )
+        assert result.returncode == 0, result.stderr
+        for row in json.loads(result.stdout.strip().splitlines()[-1]):
+            label = f"{row['name']} 상한 {row['max']}초"
+            assert row["coverGap"] < 0.05, f"{label}: 소리 일부가 빠졌습니다"
+            assert not row["gap"], f"{label}: 구간 사이에 틈이 있습니다"
+            assert row["longest"] <= row["max"] + 0.05, f"{label}: 구간이 상한을 넘었습니다"
+
+    def test_sensevoice_does_not_drop_silence(self):
+        """무음을 버리는 방식(Whisper 용)을 SenseVoice 에 쓰면 안 된다."""
+        engine = (WEB_DIR / "engine.js").read_text(encoding="utf-8")
+        spot = engine.index("async function runSenseVoice")
+        body = engine[spot : engine.index("async function runWhisper")]
+        assert "tileAtPauses(" in body, "전체를 덮는 방식을 쓰지 않습니다"
+        assert "splitIntoWindows(" not in body, "무음을 버리는 방식을 쓰고 있습니다"
 
     def test_web_files_at_the_root_match_the_deploy_copy(self):
         """뿌리의 파일이 실제로 배포되는 파일이다. 테스트는 배포본만 본다.
