@@ -122,6 +122,9 @@
   <div id="prog" class="panel hidden">
     <div class="bar"><i id="fill"></i></div>
     <div class="status" id="statusText">준비 중…</div>
+    <button id="stop" style="margin-top:12px;border-color:var(--err);color:var(--err)">
+      ■ 중지
+    </button>
   </div>
 
   <div id="err" class="note err hidden"></div>
@@ -152,10 +155,11 @@ const downloadBytes = new Map();
 let stallTimer = null;
 let currentPhase = "";
 let onMainThread = false;
+let cancelled = false;
 let workerFailed = false;      // 작업자가 한 번 실패하면 이후에는 바로 우회한다
 let mainThreadBusy = false;
 // 파일을 고칠 때마다 올린다. 브라우저가 예전 파일을 쓰지 않게 하는 용도.
-const APP_VERSION = "7";
+const APP_VERSION = "8";
 
 /* ---------- 보안 연결 확인 (마이크는 https 에서만 된다) ---------- */
 if (!window.isSecureContext) {
@@ -297,6 +301,7 @@ $("go").addEventListener("click", async () => {
   if (!picked) return;
   $("go").disabled = true;
   $("err").classList.add("hidden");
+  $("err").className = "note err";
   $("result").classList.add("hidden");
   $("prog").classList.remove("hidden");
   $("fill").style.width = "2%";
@@ -309,6 +314,22 @@ $("go").addEventListener("click", async () => {
 
   if (audio.length < SAMPLE_RATE * 0.2) return showError("소리가 너무 짧습니다.");
 
+  // 긴 녹음을 큰 모델로 돌리면 휴대폰이 오래 뜨거워진다. 미리 알리고 확인받는다.
+  const minutes = audio.length / SAMPLE_RATE / 60;
+  if (minutes > 3 && $("model").value.includes("large")) {
+    const ok = confirm(
+      `녹음이 ${minutes.toFixed(0)}분입니다.\n\n` +
+        "가장 정확한 모델로 돌리면 휴대폰이 오래 뜨거워지고 느려질 수 있습니다.\n\n" +
+        "확인을 누르면 그대로 진행하고,\n" +
+        "취소를 누르면 멈춥니다. ('정확도' 를 낮추면 훨씬 가볍습니다)",
+    );
+    if (!ok) {
+      $("prog").classList.add("hidden");
+      $("go").disabled = false;
+      return;
+    }
+  }
+
   const request = {
     audio,
     model: $("model").value,
@@ -318,6 +339,7 @@ $("go").addEventListener("click", async () => {
   };
 
   leftDuringWork = false;
+  cancelled = false;
   currentPhase = "";
   downloadBytes.clear();
   keepAwake();
@@ -454,6 +476,7 @@ async function runOnMainThread(request) {
 }
 
 function onWorker(event) {
+  if (cancelled) return;          // 중지한 뒤 뒤늦게 오는 결과는 버린다
   const d = event.data;
   if (d.type === "download") {
     // 파일마다 크기가 다르므로 받은 바이트 합계로 계산해야 정확하다.
@@ -477,6 +500,7 @@ function onWorker(event) {
     if (d.phase === "loading") {
       $("statusText").textContent = "모델 준비 중…";
     } else if (d.phase === "transcribing") {
+      releaseAwake();   // 다운로드가 끝났으면 화면을 붙잡아 둘 이유가 없다
       $("fill").style.width = "55%";
       $("statusText").textContent = onMainThread
         ? "받아쓰는 중… (이 기기에서는 화면이 잠시 멈출 수 있습니다)"
@@ -514,6 +538,22 @@ function formatResult(d) {
   }
   return lines.join("\n").trim();
 }
+
+$("stop").addEventListener("click", () => {
+  cancelled = true;
+  killWorker();                 // 작업자를 즉시 끝낸다
+  releaseAwake();
+  mainThreadBusy = false;
+  clearTimeout(stallTimer);
+  $("prog").classList.add("hidden");
+  $("go").disabled = !picked;
+  $("err").classList.remove("hidden");
+  $("err").className = "note warn";
+  $("err").textContent =
+    "중지했습니다.\n" +
+    "화면에서 직접 처리 중이었다면 잠시 뒤에 멈춥니다. " +
+    "완전히 멈추려면 이 탭을 닫았다 다시 여세요.";
+});
 
 function killWorker() {
   clearTimeout(stallTimer);

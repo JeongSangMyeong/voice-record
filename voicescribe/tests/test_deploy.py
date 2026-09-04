@@ -142,6 +142,21 @@ class TestBrowserOnlyWebApp:
     업로드 코드가 실수로 들어오면 그 약속이 깨지므로 검사한다.
     """
 
+    def test_user_can_stop_a_running_job(self):
+        """멈출 방법이 없으면 휴대폰이 뜨거워져도 탭을 닫는 수밖에 없다."""
+        html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+        assert 'id="stop"' in html
+        assert "cancelled" in html
+
+    def test_ignores_results_that_arrive_after_stopping(self):
+        html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+        assert "if (cancelled) return;" in html
+
+    def test_warns_before_a_long_recording_on_the_big_model(self):
+        html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+        assert "뜨거워지고" in html or "뜨거워질" in html
+        assert "confirm(" in html
+
     def test_diarization_uses_a_fast_transform(self):
         """정의대로 계산하면(DFT) 휴대폰이 눈에 띄게 버벅인다. FFT 여야 한다."""
         diarize = (WEB_DIR / "diarize.js").read_text(encoding="utf-8")
