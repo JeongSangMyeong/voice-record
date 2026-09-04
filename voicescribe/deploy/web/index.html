@@ -165,7 +165,7 @@ let cancelled = false;
 let workerFailed = false;      // 작업자가 한 번 실패하면 이후에는 바로 우회한다
 let mainThreadBusy = false;
 // 파일을 고칠 때마다 올린다. 브라우저가 예전 파일을 쓰지 않게 하는 용도.
-const APP_VERSION = "14";
+const APP_VERSION = "15";
 
 /* ---------- 보안 연결 확인 (마이크는 https 에서만 된다) ---------- */
 if (!window.isSecureContext) {
@@ -585,6 +585,10 @@ function formatResult(d) {
   const chunks = d.chunks || [];
   if (!chunks.length) return d.text || "(말소리를 찾지 못했습니다)";
   if (!chunks.some((c) => c.speaker)) return d.text || "(말소리를 찾지 못했습니다)";
+  // 한 사람만 말했으면 [화자1] 머리말은 군더더기다.
+  if (new Set(chunks.map((c) => c.speaker)).size < 2) {
+    return d.text || chunks.map((c) => c.text).join("\n");
+  }
 
   const lines = [];
   let current = null;

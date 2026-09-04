@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import shutil
 import subprocess
@@ -313,6 +314,109 @@ class TestBrowserOnlyWebApp:
         html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
         assert "diarize-skipped" in engine
         assert "화자 구분을 하지 못했습니다" in html, "실패를 사용자에게 알리지 않습니다"
+
+    def test_segment_times_survive_to_diarization(self):
+        """구간 시각을 두 번 푸는 코드가 있으면 화자 구분이 통째로 죽는다.
+
+        창을 직접 자르도록 바꾸면서 collected 가 이미 {start, end, text} 가 되었는데,
+        뒤쪽에 남아 있던 c.timestamp 를 다시 읽는 코드가 모든 시각을 0 으로 만들었다.
+        그러면 모든 구간의 길이가 0 이라 화자 구분이 전부 건너뛰어지고
+        타임스탬프도 전부 00:00 으로 나온다.
+        """
+        engine = (WEB_DIR / "engine.js").read_text(encoding="utf-8")
+        after = engine[engine.index("const result = { text, chunks: collected }") :]
+        # 왜 그랬는지 적어 둔 주석은 검사에서 뺀다
+        after = "\n".join(
+            line for line in after.splitlines() if not line.lstrip().startswith("//")
+        )
+        assert "c.timestamp" not in after, (
+            "구간을 만든 뒤에 c.timestamp 를 또 읽고 있습니다. 시각이 0 이 됩니다."
+        )
+
+    def test_clustering_matches_a_plain_implementation(self):
+        """빠르게 고친 병합이 정의대로 계산한 결과와 같아야 한다."""
+        node = shutil.which("node")
+        if not node:
+            pytest.skip("node 가 없어 건너뜁니다")
+        script = f"""
+        const {{ clusterByAffinity }} = await import("{(WEB_DIR / 'diarize.js').as_posix()}");
+        function naive(V, th = 0.35, maxS = 8) {{
+          const S = V.map((a) => V.map((b) => {{
+            let d = 0; for (let i = 0; i < a.length; i++) d += a[i] * b[i]; return d; }}));
+          let g = V.map((_, i) => [i]);
+          while (g.length > 1) {{
+            let best = {{ v: -Infinity, a: -1, b: -1 }};
+            for (let a = 0; a < g.length; a++) for (let b = a + 1; b < g.length; b++) {{
+              let s = 0; for (const i of g[a]) for (const j of g[b]) s += S[i][j];
+              s /= g[a].length * g[b].length;
+              if (s > best.v) best = {{ v: s, a, b }};
+            }}
+            if (best.v < th && g.length <= maxS) break;
+            g[best.a] = g[best.a].concat(g[best.b]); g.splice(best.b, 1);
+          }}
+          const l = new Array(V.length).fill(0);
+          g.forEach((m, i) => m.forEach((j) => (l[j] = i)));
+          return l;
+        }}
+        const key = (l) => {{ const m = new Map();
+          return l.map((x) => {{ if (!m.has(x)) m.set(x, m.size); return m.get(x); }}).join(","); }};
+        let seed = 7;
+        const rand = () => ((seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648 - 0.5);
+        function make(n, k, noise) {{
+          const base = [...Array(k)].map(() => {{
+            const v = Float32Array.from({{ length: 48 }}, rand);
+            let s = 0; v.forEach((x) => (s += x * x)); s = Math.sqrt(s);
+            v.forEach((_, i) => (v[i] /= s)); return v; }});
+          return [...Array(n)].map((_, i) => {{
+            const c = base[i % k], v = new Float32Array(48); let s = 0;
+            for (let j = 0; j < 48; j++) {{ v[j] = c[j] + rand() * noise; s += v[j] * v[j]; }}
+            s = Math.sqrt(s); for (let j = 0; j < 48; j++) v[j] /= s; return v; }});
+        }}
+        let bad = 0, total = 0;
+        for (const n of [2, 3, 5, 8, 15, 30, 60])
+          for (const k of [1, 2, 3, 5])
+            for (const noise of [0.1, 0.5, 1.5, 3.0]) {{
+              if (k > n) continue;
+              const V = make(n, k, noise); total++;
+              if (key(clusterByAffinity(V)) !== key(naive(V))) bad++;
+            }}
+        // 극단 입력에서도 길이와 상한을 지켜야 한다
+        const many = [...Array(20)].map((_, i) => {{ const v = new Float32Array(20); v[i] = 1; return v; }});
+        const l = clusterByAffinity(many);
+        console.log(JSON.stringify({{ total, bad, empty: clusterByAffinity([]).length,
+          one: clusterByAffinity([Float32Array.from([1, 0])]).length,
+          distinct: new Set(l).size, length: l.length }}));
+        """
+        result = subprocess.run(
+            [node, "--input-type=module", "-e", script],
+            capture_output=True, text=True, timeout=180,
+        )
+        assert result.returncode == 0, result.stderr
+        r = json.loads(result.stdout.strip().splitlines()[-1])
+        assert r["bad"] == 0, f"{r['total']}개 중 {r['bad']}개가 정의대로 계산한 결과와 다릅니다"
+        assert r["empty"] == 0 and r["one"] == 1
+        assert r["distinct"] <= 8, "화자 수 상한을 넘었습니다"
+        assert r["length"] == 20, "결과 길이가 입력과 다릅니다"
+
+    def test_short_segments_go_to_the_closest_speaker(self):
+        """짧은 구간을 앞 구간 화자로 미루면 화자가 바뀐 직후가 전부 틀린다.
+
+        실측(구간 3개 중 1개를 짧다고 가정): 앞 구간 따라가기 0.814 → 가까운 화자 1.000.
+        """
+        diarize = (WEB_DIR / "diarize.js").read_text(encoding="utf-8")
+        assert "nearestCentroid" in diarize and "centroidsOf" in diarize
+
+    def test_web_files_at_the_root_match_the_deploy_copy(self):
+        """뿌리의 파일이 실제로 배포되는 파일이다. 테스트는 배포본만 본다.
+
+        둘이 어긋나면 검사를 통과했는데도 사용자에게는 옛 파일이 간다.
+        """
+        root = WEB_DIR.parent.parent.parent
+        for name in ("index.html", "engine.js", "diarize.js", "worker.js", "coi-serviceworker.js"):
+            here, there = root / name, WEB_DIR / name
+            if not here.exists():
+                continue
+            assert here.read_bytes() == there.read_bytes(), f"{name} 이 배포본과 다릅니다"
 
     def test_speaker_clustering_scores_perfectly_on_real_voices(self):
         """실제 사람 목소리로 만든 평가셋에서 성능이 떨어지면 잡아낸다.

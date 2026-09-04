@@ -370,13 +370,12 @@ export async function runTranscription(request, onEvent) {
   const result = { text, chunks: collected };
   const elapsed = ((globalThis.performance || Date).now() - started) / 1000;
 
-  let chunks = (result.chunks || [])
-    .map((c) => ({
-      start: c.timestamp?.[0] ?? 0,
-      end: c.timestamp?.[1] ?? 0,
-      text: (c.text || "").trim(),
-    }))
-    .filter((c) => c.text);
+  // 주의: collected 는 이미 {start, end, text} 형태다.
+  // 예전에는 라이브러리가 주는 c.timestamp 를 여기서 풀었는데, 창을 직접
+  // 자르도록 바꾸면서 위에서 이미 풀게 되었다. 그런데도 이 자리에 남아 있던
+  // c.timestamp 를 다시 읽는 코드가 모든 구간의 시각을 0 으로 만들어
+  // 화자 구분이 통째로 죽고 타임스탬프가 전부 00:00 으로 나왔다.
+  let chunks = (result.chunks || []).filter((c) => c.text);
 
   let speakers = 0;
   if (request.diarize && chunks.length > 1) {

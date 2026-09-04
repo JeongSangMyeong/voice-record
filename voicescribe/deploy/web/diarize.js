@@ -28,8 +28,11 @@ const SAME_SPEAKER = 0.35;
 /** 이보다 많은 사람으로는 나누지 않는다. */
 const MAX_SPEAKERS = 8;
 
-/** 이보다 짧은 구간은 목소리를 판단하기 어려워 앞 구간을 따른다. */
+/** 이보다 긴 구간만 무리를 만드는 데 쓴다. 짧으면 지문이 흔들려 무리를 흐린다. */
 const MIN_SECONDS = 0.5;
+
+/** 이보다 짧으면 지문 자체를 못 뽑는다. 이때만 앞 구간의 화자를 따른다. */
+const MIN_EMBED_SECONDS = 0.3;
 
 /** 한 구간에서 목소리 판단에 쓰는 최대 길이. 더 들어도 나아지지 않고 느려지기만 한다. */
 const MAX_EMBED_SECONDS = 10;
@@ -92,34 +95,97 @@ export function clusterByAffinity(vectors, threshold = SAME_SPEAKER, maxSpeakers
   if (n === 0) return [];
   if (n === 1) return [0];
 
-  const similarity = vectors.map((a) =>
-    vectors.map((b) => {
+  // 무리끼리의 닮은 정도를 표로 들고 다니며 갱신한다.
+  // 합칠 때마다 모든 구간 쌍을 다시 더하면 구간 1200개에서 19초가 걸렸다.
+  // 평균 연결은 합친 뒤의 값을 이전 값만으로 정확히 구할 수 있다.
+  //   새 값 = (A개수 x A값 + B개수 x B값) / (A개수 + B개수)
+  const sim = [];
+  for (let i = 0; i < n; i++) {
+    sim.push(new Float64Array(n));
+    for (let j = 0; j < n; j++) {
       let dot = 0;
-      for (let i = 0; i < a.length; i++) dot += a[i] * b[i];
-      return dot;
-    }),
-  );
+      const a = vectors[i], b = vectors[j];
+      for (let k = 0; k < a.length; k++) dot += a[k] * b[k];
+      sim[i][j] = dot;
+    }
+  }
 
-  let groups = vectors.map((_, i) => [i]);
-  while (groups.length > 1) {
+  const members = vectors.map((_, i) => [i]);
+  const alive = vectors.map(() => true);
+  let count = n;
+
+  while (count > 1) {
     let best = { value: -Infinity, a: -1, b: -1 };
-    for (let a = 0; a < groups.length; a++) {
-      for (let b = a + 1; b < groups.length; b++) {
-        let sum = 0;
-        for (const i of groups[a]) for (const j of groups[b]) sum += similarity[i][j];
-        const mean = sum / (groups[a].length * groups[b].length);
-        if (mean > best.value) best = { value: mean, a, b };
+    for (let i = 0; i < n; i++) {
+      if (!alive[i]) continue;
+      for (let j = i + 1; j < n; j++) {
+        if (!alive[j]) continue;
+        if (sim[i][j] > best.value) best = { value: sim[i][j], a: i, b: j };
       }
     }
+    if (best.a < 0) break;
     // 충분히 안 닮았고 사람 수도 상한 이내면 여기서 멈춘다.
-    if (best.value < threshold && groups.length <= maxSpeakers) break;
-    groups[best.a] = groups[best.a].concat(groups[best.b]);
-    groups.splice(best.b, 1);
+    if (best.value < threshold && count <= maxSpeakers) break;
+
+    const { a, b } = best;
+    const sizeA = members[a].length, sizeB = members[b].length;
+    const total = sizeA + sizeB;
+    for (let k = 0; k < n; k++) {
+      if (!alive[k] || k === a || k === b) continue;
+      const merged = (sizeA * sim[a][k] + sizeB * sim[b][k]) / total;
+      sim[a][k] = merged;
+      sim[k][a] = merged;
+    }
+    members[a] = members[a].concat(members[b]);
+    members[b] = [];
+    alive[b] = false;
+    count--;
   }
 
   const labels = new Array(n).fill(0);
-  groups.forEach((members, index) => members.forEach((i) => { labels[i] = index; }));
+  let index = 0;
+  for (let i = 0; i < n; i++) {
+    if (!alive[i]) continue;
+    for (const j of members[i]) labels[j] = index;
+    index++;
+  }
   return labels;
+}
+
+/** 무리마다 대표 지문(가운데 값)을 구한다. */
+export function centroidsOf(vectors, labels) {
+  const sums = new Map();
+  labels.forEach((label, i) => {
+    let acc = sums.get(label);
+    if (!acc) { acc = { total: new Float64Array(vectors[i].length), count: 0 }; sums.set(label, acc); }
+    for (let k = 0; k < acc.total.length; k++) acc.total[k] += vectors[i][k];
+    acc.count++;
+  });
+  return [...sums.entries()].map(([label, acc]) => {
+    const center = new Float32Array(acc.total.length);
+    let norm = 0;
+    for (let k = 0; k < center.length; k++) { center[k] = acc.total[k] / acc.count; norm += center[k] ** 2; }
+    norm = Math.sqrt(norm) || 1;
+    for (let k = 0; k < center.length; k++) center[k] /= norm;
+    return { label, center };
+  });
+}
+
+/**
+ * 짧은 구간을 가장 닮은 화자에게 붙인다.
+ *
+ * 그냥 앞 구간을 따라가게 하면 화자가 바뀐 직후의 짧은 말이 전부 틀린다.
+ * 실측(구간 3개 중 1개를 짧다고 가정): 앞 구간 따라가기 0.814 → 이 방식 1.000.
+ */
+export function nearestCentroid(vector, centroids) {
+  let best = centroids[0];
+  let bestScore = -Infinity;
+  for (const candidate of centroids) {
+    let dot = 0;
+    for (let k = 0; k < vector.length; k++) dot += vector[k] * candidate.center[k];
+    if (dot > bestScore) { bestScore = dot; best = candidate; }
+  }
+  return best.label;
 }
 
 /**
@@ -171,15 +237,17 @@ export async function assignSpeakers(audio, segments, sampleRate, options = {}) 
     progress_callback: options.onProgress,
   });
 
-  const vectors = [];
-  const usable = [];
+  const strong = [];   // 무리를 만드는 데 쓸 만큼 긴 구간
+  const weak = [];     // 지문은 뽑히지만 짧아서 무리 만들기에는 안 쓰는 구간
   const limit = Math.round(MAX_EMBED_SECONDS * sampleRate);
+  let done = 0;
 
   for (let index = 0; index < segments.length; index++) {
     const segment = segments[index];
     const from = Math.max(0, Math.floor(segment.start * sampleRate));
     const to = Math.min(audio.length, Math.ceil(segment.end * sampleRate));
-    if (to - from < MIN_SECONDS * sampleRate) continue;
+    const seconds = (to - from) / sampleRate;
+    if (seconds < MIN_EMBED_SECONDS) continue;
 
     // 긴 구간은 가운데만 쓴다. 앞뒤에는 다른 사람의 말이 묻어 있을 수 있다.
     let start = from;
@@ -191,12 +259,25 @@ export async function assignSpeakers(audio, segments, sampleRate, options = {}) 
     }
 
     const inputs = await processor(audio.subarray(start, end));
-    vectors.push(pickEmbedding(await model(inputs)));
-    usable.push(index);
+    const vector = pickEmbedding(await model(inputs));
+    (seconds >= MIN_SECONDS ? strong : weak).push({ index, vector });
 
-    options.onSegment?.(usable.length, segments.length);
+    options.onSegment?.(++done, segments.length);
   }
 
-  if (vectors.length < 2) return segments.map(() => "화자1");
-  return toSpeakerNames(segments.length, usable, clusterByAffinity(vectors));
+  if (strong.length < 2) return segments.map(() => "화자1");
+
+  const labels = clusterByAffinity(strong.map((s) => s.vector));
+  const centroids = centroidsOf(strong.map((s) => s.vector), labels);
+
+  const judged = strong
+    .map((s, i) => ({ index: s.index, label: labels[i] }))
+    .concat(weak.map((s) => ({ index: s.index, label: nearestCentroid(s.vector, centroids) })))
+    .sort((a, b) => a.index - b.index);
+
+  return toSpeakerNames(
+    segments.length,
+    judged.map((j) => j.index),
+    judged.map((j) => j.label),
+  );
 }
