@@ -324,223 +324,7 @@ function toWindows(ranges, audio, sampleRate, maxSeconds = WINDOW_SECONDS) {
 }
 
 
-/* ---------- SenseVoice (한/중/일/영/광둥어 전용 엔진) ---------- */
-
-/**
- * onnxruntime-web. 이 모델은 정수 연산이라 CPU 쪽이 맞아 WASM 판을 쓴다.
- *
- * 반드시 우리 사이트에 직접 두고 써야 한다. CDN 주소로 불러오면
- * 브라우저가 그 스크립트로 작업자(Worker)를 만들지 못하게 막아
- * "SecurityError: Failed to construct 'Worker'" 로 죽는다(실제로 겪었다).
- * CPU 를 여러 개 쓰려면 작업자가 필요하므로 피할 수 없는 조건이다.
- */
-const ORT_DIR = "./ort/";
-const ORT_URL = `${ORT_DIR}ort.bundle.min.mjs`;
-
-let senseVoice = null;
-
-/**
- * 큰 파일을 받으면서 진행률을 알려 주고, 다음부터는 저장해 둔 것을 쓴다.
- *
- * 받은 조각을 자바스크립트 쪽에 쌓아 두면 239MB 파일 하나에 순간 두 배가 든다.
- * 휴대폰에서는 그것만으로 탭이 죽을 수 있다. 그래서 내려받은 응답은 곧바로
- * 저장소로 흘려보내고, 진행률은 복사본을 읽어 세기만 한다(내용은 버린다).
- */
-async function fetchCached(url, onEvent, label) {
-  const store = globalThis.caches ? await caches.open("voice-record-models") : null;
-  const hit = await store?.match(url);
-  if (hit) return hit.arrayBuffer();
-
-  const response = await fetch(url);
-  if (!response.ok) throw new Error(`${label} 을(를) 받지 못했습니다 (${response.status})`);
-  if (!store) return response.arrayBuffer();
-
-  const total = Number(response.headers.get("content-length")) || 0;
-  const counting = response.clone();
-  const saved = store.put(url, response);   // 곧바로 저장소로 흘려보낸다
-
-  const reader = counting.body?.getReader();
-  if (reader) {
-    let loaded = 0;
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      loaded += value.length;              // 세기만 하고 내용은 붙들지 않는다
-      onEvent({ type: "download", file: label, loaded, total: total || loaded });
-    }
-  }
-  await saved;
-  onEvent({ type: "download-done", file: label });
-
-  const stored = await store.match(url);
-  if (!stored) throw new Error(`${label} 을(를) 저장하지 못했습니다.`);
-  return stored.arrayBuffer();
-}
-
-async function loadSenseVoice(onEvent) {
-  if (senseVoice) return senseVoice;
-
-  let ort;
-  try {
-    ort = await import(/* @vite-ignore */ new URL(ORT_URL, import.meta.url).href);
-  } catch (error) {
-    throw new Error(
-      "음성인식 엔진을 불러오지 못했습니다.\n페이지를 새로고침해 주세요.\n" +
-        `(${error?.message || error})`,
-    );
-  }
-  ort.env.wasm.wasmPaths = new URL(ORT_DIR, import.meta.url).href;
-  // 헤더가 붙어 있을 때만 CPU 를 여러 개 쓸 수 있다(coi-serviceworker.js 참고).
-  ort.env.wasm.numThreads = currentThreads();
-
-  const helpers = await import("./sensevoice.js");
-  const [modelBuffer, tokensBuffer, metaResponse] = await Promise.all([
-    fetchCached(`${helpers.SENSEVOICE_REPO}/model.int8.onnx`, onEvent, "받아쓰기 모델"),
-    fetchCached(`${helpers.SENSEVOICE_REPO}/tokens.txt`, onEvent, "글자표"),
-    fetch("./sensevoice-meta.json"),
-  ]);
-  const meta = helpers.parseMeta(await metaResponse.json());
-  const tokens = helpers.parseTokens(new TextDecoder().decode(tokensBuffer));
-  const session = await ort.InferenceSession.create(modelBuffer, {
-    executionProviders: ["wasm"],
-    graphOptimizationLevel: "all",
-  });
-
-  senseVoice = { ort, session, meta, tokens, helpers };
-  return senseVoice;
-}
-
-/** SenseVoice 는 이 언어들만 안다. 나머지는 Whisper 를 써야 한다. */
-export const SENSEVOICE_LANGUAGES = ["auto", "ko", "en", "ja", "zh", "yue"];
-
-/** 모델 고르는 칸에서 SenseVoice 를 가리키는 이름. */
-export const SENSEVOICE_MODEL = "sensevoice-small";
-
-/**
- * 받는 용량(MB). 모델 228MB + 글자표 0.3MB + 엔진 11MB.
- * Whisper 와 달리 기기에 따라 달라지지 않는다.
- */
-export const SENSEVOICE_SIZE_MB = 239;
-
-/** SenseVoice 용 구간 길이(초). Whisper 보다 짧게 잡는다(위 설명 참고). */
-const SENSEVOICE_WINDOW_SECONDS = 12;
-
-/**
- * 소리 전체를 빠짐없이 덮는 구간으로 나눈다. 경계는 조용한 곳 한가운데로 잡는다.
- *
- * Whisper 쪽에서 쓰는 방식(조용한 부분을 아예 버리는 것)을 SenseVoice 에 쓰면
- * 말끝이 잘려 결과가 나빠진다. 실측으로 확인했다.
- *   파일 통째로        조금만 생각을 하면서 살면 훨씬 편할 거야.   (정확)
- *   무음을 버리고 자름  조 금만 생각 을 하 면서 살 면 훨씬 편할 거야.  (띄어쓰기 무너짐)
- * SenseVoice 는 실시간 대비 수십 배로 빨라, 조용한 부분을 건너뛰어 얻는 이득보다
- * 말이 잘리는 손해가 크다.
- */
-export function tileAtPauses(audio, sampleRate, maxSeconds = SENSEVOICE_WINDOW_SECONDS) {
-  const totalSeconds = audio.length / sampleRate;
-  if (totalSeconds <= maxSeconds) {
-    return [{ start: 0, end: totalSeconds, from: 0, to: audio.length }];
-  }
-
-  // 짧게 끊어 소리 크기를 재고, 조용한 구간을 찾는다.
-  const frame = Math.max(1, Math.round(sampleRate * 0.02));
-  const frames = Math.floor(audio.length / frame);
-  const energy = new Float32Array(frames);
-  let loudest = 0;
-  for (let f = 0; f < frames; f++) {
-    let sum = 0;
-    for (let i = f * frame; i < (f + 1) * frame; i++) sum += audio[i] * audio[i];
-    energy[f] = Math.sqrt(sum / frame);
-    if (energy[f] > loudest) loudest = energy[f];
-  }
-  const quiet = loudest * 0.06;
-
-  // 조용한 구간의 한가운데 위치(초)를 모아 둔다.
-  const pauses = [];
-  let run = -1;
-  for (let f = 0; f <= frames; f++) {
-    const isQuiet = f < frames && energy[f] < quiet;
-    if (isQuiet && run < 0) run = f;
-    else if (!isQuiet && run >= 0) {
-      if ((f - run) * frame >= sampleRate * 0.2) {
-        pauses.push((((run + f) / 2) * frame) / sampleRate);
-      }
-      run = -1;
-    }
-  }
-
-  const windows = [];
-  let start = 0;
-  const minSeconds = Math.min(3, maxSeconds / 2);
-  while (start < totalSeconds - 0.05) {
-    let end = Math.min(totalSeconds, start + maxSeconds);
-    if (end < totalSeconds) {
-      // 상한 안에서 가장 늦은 '쉬는 자리' 를 경계로 삼는다. 없으면 상한 그대로.
-      let latest = -1;
-      for (const pause of pauses) {
-        if (pause > start + minSeconds && pause <= end && pause > latest) latest = pause;
-      }
-      if (latest > 0) end = latest;
-    }
-    if (end <= start) end = Math.min(totalSeconds, start + maxSeconds);
-    windows.push({
-      start,
-      end,
-      from: Math.floor(start * sampleRate),
-      to: Math.min(audio.length, Math.ceil(end * sampleRate)),
-    });
-    start = end;
-  }
-  return windows;
-}
-
-async function runSenseVoice(request, onEvent) {
-  const { audio, language, sampleRate } = request;
-
-  onEvent({ type: "phase", phase: "loading" });
-  const { session, meta, tokens, helpers, ort } = await loadSenseVoice(onEvent);
-  onEvent({ type: "device", device: "wasm", threads: currentThreads() });
-
-  onEvent({ type: "phase", phase: "transcribing" });
-  const started = (globalThis.performance || Date).now();
-
-  // SenseVoice 는 글자별 시각을 주지 않는다. 구간을 짧게 잡아야 화자 구분과
-  // 시각 표시가 뭉개지지 않는다. 엔진이 빨라서 호출이 늘어도 부담이 적다.
-  // 조용한 부분을 버리지 않고 전체를 덮는다(위 tileAtPauses 설명 참고).
-  const windows = tileAtPauses(audio, sampleRate, SENSEVOICE_WINDOW_SECONDS);
-  onEvent({
-    type: "plan",
-    windows: windows.length,
-    speechSeconds: windows.reduce((sum, w) => sum + (w.end - w.start), 0),
-    totalSeconds: audio.length / sampleRate,
-  });
-
-  const collected = [];
-  let text = "";
-  const wanted = SENSEVOICE_LANGUAGES.includes(language) ? language : "auto";
-
-  for (let i = 0; i < windows.length; i++) {
-    const w = windows[i];
-    const piece = await helpers.transcribeChunk(audio.subarray(w.from, w.to), session, {
-      Tensor: ort.Tensor, meta, tokens, language: wanted, itn: true,
-    });
-    if (piece) {
-      text += (text ? " " : "") + piece;
-      // CTC 는 글자별 시각을 주지 않는다. 구간 전체를 한 덩어리로 둔다.
-      collected.push({ start: w.start, end: w.end, text: piece });
-    }
-    const done = i + 1;
-    const spent = ((globalThis.performance || Date).now() - started) / 1000;
-    onEvent({
-      type: "progress", done, total: windows.length, elapsed: spent,
-      remaining: done > 0 ? (spent / done) * (windows.length - done) : null,
-    });
-  }
-
-  return { text, chunks: collected, elapsed: ((globalThis.performance || Date).now() - started) / 1000,
-           device: "wasm" };
-}
-
-/** Whisper 로 받아쓴다(SenseVoice 가 모르는 언어용). */
+/** 오디오를 받아쓴다(내부 구현). */
 async function runWhisper(request, onEvent) {
   const { audio, model, language, sampleRate } = request;
 
@@ -626,18 +410,13 @@ async function runWhisper(request, onEvent) {
 /**
  * 오디오를 받아쓴다.
  *
- * 엔진이 둘이다. 한/중/일/영/광둥어는 SenseVoice 가 더 정확하고 훨씬 빠르다.
- * 그 밖의 언어나 사용자가 Whisper 를 고른 경우에는 Whisper 를 쓴다.
- *
  * @param {{audio: Float32Array, model: string, language: string, sampleRate: number}} request
  * @param {(event: object) => void} onEvent 진행 상황을 알려 주는 콜백
  */
 export async function runTranscription(request, onEvent) {
   const { audio, sampleRate } = request;
 
-  const result = request.model === SENSEVOICE_MODEL
-    ? await runSenseVoice(request, onEvent)
-    : await runWhisper(request, onEvent);
+  const result = await runWhisper(request, onEvent);
   const elapsed = result.elapsed;
   const device = result.device;
 
@@ -652,8 +431,7 @@ export async function runTranscription(request, onEvent) {
   if (request.diarize && chunks.length > 1) {
     onEvent({ type: "phase", phase: "diarizing" });
     try {
-      // SenseVoice 로 받아쓴 경우에는 아직 이 라이브러리를 불러오지 않았다.
-      // 화자 구분은 이 라이브러리의 목소리 모델을 쓰므로 여기서 준비한다.
+      // 화자 구분도 같은 라이브러리의 목소리 모델을 쓴다. 아직이면 여기서 준비한다.
       if (!libRef) await loadLibrary();
       const { assignSpeakers } = await import("./diarize.js");
       const labels = await assignSpeakers(audio, chunks, sampleRate, {

@@ -530,225 +530,19 @@ class TestBrowserOnlyWebApp:
         assert "들리지 않는 소리" in html, "소리를 재생한다는 사실을 알리지 않습니다"
         assert "아이폰" in html, "아이폰에서는 안 된다는 안내가 없습니다"
 
-    def test_sensevoice_features_match_the_reference(self):
-        """소리에서 특징을 뽑는 계산이 조금만 틀어져도 인식이 통째로 망가진다.
+    def test_default_model_is_the_most_accurate(self):
+        """기본값은 가장 정확한 것이어야 하고, 안내가 기본값과 어긋나면 안 된다.
 
-        파이썬 기준 구현으로 미리 계산해 둔 값과 자바스크립트 결과를 대조한다.
-        (기준 구현 자체는 sherpa-onnx 의 출력과 4개 언어에서 일치하는 것을 확인했다)
-        """
-        node = shutil.which("node")
-        if not node:
-            pytest.skip("node 가 없어 건너뜁니다")
-
-        reference = Path(__file__).parent / "sensevoice_reference.json"
-        script = f"""
-        import fs from "node:fs";
-        const m = await import("{(WEB_DIR / 'sensevoice.js').as_posix()}");
-        const gold = JSON.parse(fs.readFileSync("{reference.as_posix()}", "utf8"));
-        const meta = m.parseMeta(JSON.parse(
-          fs.readFileSync("{(WEB_DIR / 'sensevoice-meta.json').as_posix()}", "utf8")));
-        const audio = Float32Array.from(gold["소리표본"]);
-        const mel = m.computeFbank(audio, 16000);
-        const lfr = m.applyLfr(mel, meta.lfrWindowSize, meta.lfrWindowShift);
-        m.applyCmvn(lfr, meta.negMean, meta.invStddev);
-        const diff = (a, b) => Math.max(...a.map((x, i) => Math.abs(x - b[i])));
-        console.log(JSON.stringify({{
-          melFrames: mel.length,
-          melDim: mel[0]?.length,
-          lfrFrames: lfr.length,
-          lfrDim: lfr[0]?.length,
-          firstMelDiff: diff([...mel[0]], gold["멜첫줄"]),
-          normHeadDiff: diff([...lfr[0]].slice(0, 20), gold["정규화첫줄앞20"]),
-        }}));
-        """
-        result = subprocess.run(
-            [node, "--input-type=module", "-e", script],
-            capture_output=True, text=True, timeout=120,
-        )
-        assert result.returncode == 0, result.stderr
-        r = json.loads(result.stdout.strip().splitlines()[-1])
-        gold = json.loads(reference.read_text(encoding="utf-8"))
-        # 표본을 잘라 넣었으므로 프레임 수는 잘린 길이에 맞게 나온다
-        assert r["melDim"] == 80 and r["lfrDim"] == 560
-        assert r["melFrames"] > 0 and r["lfrFrames"] > 0
-        assert r["firstMelDiff"] < 1e-3, f"멜 특징이 어긋납니다: {r['firstMelDiff']}"
-        assert r["normHeadDiff"] < 1e-2, f"정규화 결과가 어긋납니다: {r['normHeadDiff']}"
-
-    def test_sensevoice_preprocessing_rules_are_complete(self):
-        """브라우저는 ONNX 안의 규칙을 못 읽어서 따로 빼 두었다. 빠지면 인식이 안 된다."""
-        import json as _json
-
-        meta = _json.loads((WEB_DIR / "sensevoice-meta.json").read_text(encoding="utf-8"))
-        assert len(meta["neg_mean"]) == 560
-        assert len(meta["inv_stddev"]) == 560
-        assert meta["lfr_window_size"] == "7" and meta["lfr_window_shift"] == "6"
-        for code in ("lang_auto", "lang_ko", "lang_en", "lang_ja", "lang_zh", "lang_yue"):
-            assert code in meta, f"언어 코드가 빠졌습니다: {code}"
-        # sherpa-onnx 2024-07-17 판. 신판(2025-09-09)은 한국어가 깨진다.
-        assert meta["크기"] == 239233841, "확인한 것과 다른 모델을 가리키고 있습니다"
-
-    def test_sensevoice_ctc_decoding(self):
-        """같은 글자가 이어지면 하나로 합치고 빈칸은 버려야 한다."""
-        node = shutil.which("node")
-        if not node:
-            pytest.skip("node 가 없어 건너뜁니다")
-        script = f"""
-        const m = await import("{(WEB_DIR / 'sensevoice.js').as_posix()}");
-        const tokens = ["<blank>", "▁안녕", "하", "세", "요", "<|ko|>"];
-        // 프레임마다 고를 번호: 빈칸(0)과 반복을 섞어 둔다
-        const ids = [0, 5, 1, 1, 0, 2, 2, 2, 3, 0, 4, 4];
-        const vocab = tokens.length;
-        const logits = new Float32Array(ids.length * vocab);
-        ids.forEach((id, t) => (logits[t * vocab + id] = 10));
-        const pieces = m.ctcGreedy(logits, ids.length, vocab, tokens);
-        console.log(JSON.stringify({{ pieces, text: m.detokenize(pieces),
-          tokens: m.parseTokens("<blank> 0\\n▁안녕 1\\n하 2\\n") }}));
-        """
-        result = subprocess.run(
-            [node, "--input-type=module", "-e", script],
-            capture_output=True, text=True, timeout=60,
-        )
-        assert result.returncode == 0, result.stderr
-        r = json.loads(result.stdout.strip().splitlines()[-1])
-        assert r["text"] == "안녕하세요", f"해독 결과가 다릅니다: {r['text']!r}"
-        assert r["tokens"] == ["<blank>", "▁안녕", "하"], r["tokens"]
-
-    def test_sensevoice_windows_are_short_enough_for_speakers(self):
-        """SenseVoice 는 글자별 시각을 주지 않는다.
-
-        구간을 길게 잡으면 그 구간 전체가 한 화자로 뭉쳐 버린다.
-        """
-        engine = (WEB_DIR / "engine.js").read_text(encoding="utf-8")
-        match = re.search(r"SENSEVOICE_WINDOW_SECONDS = (\d+)", engine)
-        assert match, "SenseVoice 용 구간 길이를 찾지 못했습니다"
-        assert int(match.group(1)) <= 15, "구간이 길어 화자 구분이 뭉개집니다"
-        assert "tileAtPauses(audio, sampleRate, SENSEVOICE_WINDOW_SECONDS)" in engine
-
-    def test_diarization_works_with_sensevoice_too(self):
-        """SenseVoice 경로에서는 화자 구분용 라이브러리를 아직 안 불러온 상태다.
-
-        그대로 두면 화자 구분이 항상 실패한다(실제로 그랬다).
-        """
-        engine = (WEB_DIR / "engine.js").read_text(encoding="utf-8")
-        spot = engine.index('const { assignSpeakers } = await import("./diarize.js")')
-        before = engine[max(0, spot - 400) : spot]
-        assert "if (!libRef) await loadLibrary();" in before, (
-            "SenseVoice 로 받아쓰면 화자 구분이 실패합니다"
-        )
-
-    def test_engine_choice_is_understandable(self):
-        """어느 것이 무슨 엔진인지 화면만 보고 알 수 있어야 한다.
-
-        예전에는 칸 이름이 '정확도' 였고 그 밑에 '한국어는 가장 정확을 권합니다'
-        라는 옛 안내가 남아 있어서, 기본값과 정반대로 안내하고 있었다.
-        사용자가 '뭐가 SenseVoice 냐' 고 물어본 이유다.
+        예전에 '한국어는 가장 정확을 권합니다' 라는 옛 안내가 기본값과 정반대로
+        남아 있어서 사용자가 어느 것을 골라야 하는지 물어본 적이 있다.
         """
         html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
         select = html[html.index('<select id="model">') : html.index("</select>", html.index('<select id="model">'))]
-        assert "SenseVoice" in select, "엔진 이름이 화면에 없습니다"
-        assert "Whisper" in select, "엔진 이름이 화면에 없습니다"
-        assert "optgroup" in select, "어느 것이 어느 언어용인지 묶여 있지 않습니다"
         # 실제 회의 녹음으로 재 보니 Whisper 가 확실히 정확했다. 그쪽이 기본값이어야 한다.
         assert 'value="onnx-community/whisper-large-v3-turbo" selected' in select, (
             "가장 정확한 엔진이 기본값이 아닙니다"
         )
         assert "한국어는 <b>가장 정확</b>을 권합니다" not in html, "옛 안내가 남아 있습니다"
-
-    def test_sensevoice_is_honestly_labelled(self):
-        """SenseVoice 는 빠르지만 정확도가 낮다. 그대로 적어야 한다.
-
-        실제 2분짜리 한국어 회의 녹음으로 비교한 결과다.
-          SenseVoice  '워그샵', '다 다음 주', '해외영을', 띄어쓰기 무너짐, 화자 구분 안 됨
-          Whisper     '업크샵', '다음주에', '해외영업을', 문장부호 있음, 화자 3명 구분
-        글자를 한 번에 뱉는 방식(CTC)이라 문맥으로 단어 경계를 잡지 못하는 한계다.
-        설정(언어 지정·문장부호)을 바꿔도 같은 오류가 나는 것을 확인했다.
-        """
-        html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
-        select = html[html.index('<select id="model">') : html.index("</select>", html.index('<select id="model">'))]
-        sense = [line for line in select.splitlines() if "sensevoice-small" in line]
-        assert sense, "SenseVoice 선택지가 없습니다"
-        assert "정확도 낮음" in sense[0], "정확도가 낮다는 사실을 적지 않았습니다"
-        assert "화자 구분도 잘 안 됩니다" in html, "화자 구분이 약하다는 안내가 없습니다"
-
-    def test_onnx_engine_is_served_from_our_own_site(self):
-        """CDN 주소로 불러오면 브라우저가 작업자를 못 만들어 통째로 죽는다.
-
-        실제 오류: SecurityError: Failed to construct 'Worker': Script at
-        'https://cdn.jsdelivr.net/.../ort.bundle.min.mjs' cannot be accessed
-        from origin 'https://jeongsangmyeong.github.io'.
-        CPU 를 여러 개 쓰려면 작업자가 필요하므로 같은 사이트에 두어야 한다.
-        """
-        engine = (WEB_DIR / "engine.js").read_text(encoding="utf-8")
-        block = engine[engine.index("const ORT_DIR") : engine.index("let senseVoice")]
-        assert "cdn.jsdelivr.net" not in block and "unpkg.com" not in block, (
-            "onnxruntime 을 CDN 에서 불러오면 작업자를 만들지 못해 죽습니다"
-        )
-        assert 'const ORT_DIR = "./ort/"' in engine
-
-        root = WEB_DIR.parent.parent.parent
-        for name in ("ort.bundle.min.mjs", "ort-wasm-simd-threaded.mjs",
-                     "ort-wasm-simd-threaded.wasm"):
-            assert (root / "ort" / name).exists(), f"엔진 파일이 없습니다: ort/{name}"
-
-    def test_sensevoice_windows_cover_everything(self):
-        """조용한 부분을 버리고 자르면 말끝이 잘려 결과가 나빠진다.
-
-        실측: 파일 통째로 넣으면 '조금만 생각을 하면서 살면 훨씬 편할 거야.' 인데
-        무음을 버리고 자르면 '조 금만 생각 을 하 면서 살 면 훨씬 편할 거야.' 가 된다.
-        SenseVoice 용 구간은 소리 전체를 빠짐없이 덮어야 한다.
-        """
-        node = shutil.which("node")
-        if not node:
-            pytest.skip("node 가 없어 건너뜁니다")
-        script = f"""
-        const {{ tileAtPauses }} = await import("{(WEB_DIR / 'engine.js').as_posix()}");
-        const sr = 16000;
-        const make = (seconds, speaking) => {{
-          const a = new Float32Array(sr * seconds);
-          for (let i = 0; i < a.length; i++) {{
-            const t = i / sr;
-            if (speaking(t)) a[i] = Math.sin(i * 0.05) * 0.3;
-          }}
-          return a;
-        }};
-        const cases = [
-          ["짧음", make(5, () => true)],
-          ["쉼표 있는 긴 소리", make(90, (t) => t % 7 < 5)],
-          ["끊김 없는 긴 소리", make(90, () => true)],
-          ["거의 무음", make(40, (t) => t > 39.5)],
-        ];
-        const out = [];
-        for (const [name, audio] of cases) {{
-          for (const max of [12, 28]) {{
-            const w = tileAtPauses(audio, sr, max);
-            const total = audio.length / sr;
-            const covered = w.reduce((s, x) => s + (x.end - x.start), 0);
-            const gap = w.slice(1).some((x, i) => Math.abs(x.start - w[i].end) > 1e-6);
-            out.push({{ name, max, windows: w.length,
-              coverGap: Math.abs(covered - total),
-              gap, longest: Math.max(...w.map((x) => x.end - x.start)) }});
-          }}
-        }}
-        console.log(JSON.stringify(out));
-        """
-        result = subprocess.run(
-            [node, "--input-type=module", "-e", script],
-            capture_output=True, text=True, timeout=120,
-        )
-        assert result.returncode == 0, result.stderr
-        for row in json.loads(result.stdout.strip().splitlines()[-1]):
-            label = f"{row['name']} 상한 {row['max']}초"
-            assert row["coverGap"] < 0.05, f"{label}: 소리 일부가 빠졌습니다"
-            assert not row["gap"], f"{label}: 구간 사이에 틈이 있습니다"
-            assert row["longest"] <= row["max"] + 0.05, f"{label}: 구간이 상한을 넘었습니다"
-
-    def test_sensevoice_does_not_drop_silence(self):
-        """무음을 버리는 방식(Whisper 용)을 SenseVoice 에 쓰면 안 된다."""
-        engine = (WEB_DIR / "engine.js").read_text(encoding="utf-8")
-        spot = engine.index("async function runSenseVoice")
-        body = engine[spot : engine.index("async function runWhisper")]
-        assert "tileAtPauses(" in body, "전체를 덮는 방식을 쓰지 않습니다"
-        assert "splitIntoWindows(" not in body, "무음을 버리는 방식을 쓰고 있습니다"
 
     def test_web_files_at_the_root_match_the_deploy_copy(self):
         """뿌리의 파일이 실제로 배포되는 파일이다. 테스트는 배포본만 본다.
@@ -757,8 +551,7 @@ class TestBrowserOnlyWebApp:
         """
         root = WEB_DIR.parent.parent.parent
         for name in ("index.html", "engine.js", "diarize.js", "worker.js",
-                     "coi-serviceworker.js", "manifest.json", "sensevoice.js",
-                     "sensevoice-meta.json",
+                     "coi-serviceworker.js", "manifest.json",
                      "icon-192.png", "icon-512.png", "apple-touch-icon.png"):
             here, there = root / name, WEB_DIR / name
             if not here.exists():
@@ -923,7 +716,7 @@ class TestBrowserOnlyWebApp:
         모델을 내려받으려면 fetch 가 필요하므로 무조건 금지할 수는 없다.
         대신 모든 요청이 (1) 알려진 모델 주소이고 (2) 보내는 내용이 없는지 본다.
         """
-        files = ["index.html", "worker.js", "engine.js", "sensevoice.js", "diarize.js"]
+        files = ["index.html", "worker.js", "engine.js", "diarize.js"]
         allowed = ("huggingface.co", "cdn.jsdelivr.net", "unpkg.com", "./", "`${")
         for name in files:
             path = WEB_DIR / name

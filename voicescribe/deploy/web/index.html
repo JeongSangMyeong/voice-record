@@ -100,20 +100,15 @@
         </select>
       </div>
       <div>
-        <label class="f" for="model">받아쓰기 엔진</label>
+        <label class="f" for="model">정확도</label>
         <select id="model">
-          <optgroup label="정확하게 (모든 언어)">
-            <option value="onnx-community/whisper-large-v3-turbo" selected>✅ Whisper 큼 — 권장 (가장 정확)</option>
-            <option value="onnx-community/whisper-small">Whisper 보통</option>
-            <option value="onnx-community/whisper-base">Whisper 작음 — 빠름</option>
-            <option value="onnx-community/whisper-tiny">Whisper 아주 작음 — 가장 빠름</option>
-          </optgroup>
-          <optgroup label="빠르게 훑어보기 (한·중·일·영)">
-            <option value="sensevoice-small">SenseVoice — 아주 빠름, 대신 정확도 낮음</option>
-          </optgroup>
+          <option value="onnx-community/whisper-large-v3-turbo" selected>✅ 큼 — 권장 (가장 정확)</option>
+          <option value="onnx-community/whisper-small">보통</option>
+          <option value="onnx-community/whisper-base">작음 — 빠름</option>
+          <option value="onnx-community/whisper-tiny">아주 작음 — 가장 빠름</option>
         </select>
         <div class="status" style="margin-top:6px">
-          제대로 받아쓰려면 <b>맨 위 Whisper 큼</b> 을 쓰세요. 처음 한 번만 받고 이후엔 저장됩니다.
+          제대로 받아쓰려면 <b>맨 위 큼</b> 을 쓰세요. 처음 한 번만 받고 이후엔 저장됩니다.
         </div>
       </div>
     </div>
@@ -173,9 +168,6 @@ const downloadBytes = new Map();
 let stallTimer = null;
 let currentPhase = "";
 let profileKey = "wasm";
-let senseVoiceModel = "sensevoice-small";
-let senseVoiceSizeMB = null;
-const SENSEVOICE_LANGS = ["auto", "ko", "en", "ja", "zh", "yue"];
 let diarizeSkipped = false;
 let modelSizes = null;
 let planTotal = 0;
@@ -184,7 +176,7 @@ let cancelled = false;
 let workerFailed = false;      // 작업자가 한 번 실패하면 이후에는 바로 우회한다
 let mainThreadBusy = false;
 // 파일을 고칠 때마다 올린다. 브라우저가 예전 파일을 쓰지 않게 하는 용도.
-const APP_VERSION = "24";
+const APP_VERSION = "25";
 
 /* ---------- 보안 연결 확인 (마이크는 https 에서만 된다) ---------- */
 if (!window.isSecureContext) {
@@ -301,8 +293,6 @@ async function checkDevice() {
     const eng = await import(`./engine.js?v=${APP_VERSION}`);
     profileKey = await eng.pickProfileKey(hasWebGPU ? "webgpu" : "wasm");
     modelSizes = eng.MODEL_PROFILES;
-    senseVoiceModel = eng.SENSEVOICE_MODEL;
-    senseVoiceSizeMB = eng.SENSEVOICE_SIZE_MB;
   } catch {
     /* 못 읽어도 안내 문구만 덜 자세해질 뿐이다 */
   }
@@ -315,13 +305,11 @@ async function checkDevice() {
 
 /** 이 기기에서 이 모델을 고르면 실제로 몇 MB 를 받는지. 모르면 null. */
 function sizeForSelected() {
-  if ($("model").value === senseVoiceModel) return senseVoiceSizeMB;
   return modelSizes?.[$("model").value]?.[profileKey]?.sizeMB ?? null;
 }
 
 function updateModelHint() {
-  const sense = $("model").value === senseVoiceModel;
-  const big = !sense && $("model").value.includes("large");
+  const big = $("model").value.includes("large");
   const mb = sizeForSelected();
   const sizeNote = mb === null ? "" : ` (약 ${mb}MB)`;
   const box = $("firstRun");
@@ -333,18 +321,6 @@ function updateModelHint() {
       "이 기기는 <b>빠른 모드(WebGPU)를 지원하지 않습니다.</b> " +
       "가장 정확한 모델은 매우 느리고 휴대폰이 뜨거워질 수 있습니다.<br />" +
       "<b>보통</b> 을 권합니다. 그래도 쓰시려면 짧은 녹음으로 먼저 시험해 보세요.";
-    return;
-  }
-  if (sense) {
-    const lang = $("lang").value;
-    const known = SENSEVOICE_LANGS.includes(lang);
-    box.className = "note warn";
-    box.innerHTML = known
-      ? `아주 빠른 대신 <b>정확도가 떨어집니다</b>${sizeNote}.<br />` +
-        "긴 문장에서 띄어쓰기와 단어가 자주 틀리고, <b>화자 구분도 잘 안 됩니다.</b><br />" +
-        "내용만 빠르게 훑어볼 때 쓰고, 제대로 받아쓰려면 <b>Whisper 큼</b> 을 쓰세요."
-      : "이 엔진은 <b>한국어·영어·일본어·중국어·광둥어</b>만 압니다.<br />" +
-        "다른 언어는 위쪽 <b>Whisper</b> 로 바꿔 주세요.";
     return;
   }
   box.className = "note info";
