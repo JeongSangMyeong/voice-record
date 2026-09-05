@@ -1,0 +1,29 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cd voicescribe && *)",
+      "Bash(python:*)",
+      "Bash(python3:*)",
+      "Bash(pytest:*)",
+      "Bash(uv pip install:*)",
+      "Bash(uv venv:*)",
+      "Bash(pip install:*)",
+      "Bash(ruff check:*)",
+      "Bash(ruff format:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "mcp__voicescribe__list_supported_languages",
+      "mcp__voicescribe__check_setup",
+      "mcp__context7__*"
+    ],
+    "ask": [
+      "mcp__voicescribe__transcribe_audio"
+    ],
+    "deny": [
+      "Read(./**/*.env)",
+      "Read(./**/secrets/**)"
+    ]
+  },
+  "enableAllProjectMcpServers": false
+}
