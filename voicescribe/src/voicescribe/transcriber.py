@@ -71,14 +71,18 @@ def transcribe_buffer(
     result = engine.transcribe(audio, options, progress)
 
     if request.diarize:
-        from .diarize import apply_diarization
+        from .diarize import apply_diarization, speakers_hint_from_name
 
+        min_speakers, max_speakers = request.min_speakers, request.max_speakers
+        if min_speakers is None and max_speakers is None:
+            # '통화녹음_이름' 같은 통화 녹음은 두 사람이다. 사용자가 인원을 주면 그쪽이 먼저다.
+            min_speakers = max_speakers = speakers_hint_from_name(request.path)
         report(progress, 0.90, "화자 구분 중")
         apply_diarization(
             audio,
             result,
-            min_speakers=request.min_speakers,
-            max_speakers=request.max_speakers,
+            min_speakers=min_speakers,
+            max_speakers=max_speakers,
         )
 
     target = normalize_language(request.translate_to)

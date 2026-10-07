@@ -1070,3 +1070,56 @@ class TestIphoneDoesNotReload:
         lost = engine[engine.index("if (device === \"webgpu\" && isDeviceLost(error))") :][:500]
         assert "transcriber = null" in lost and "loadedKey = null" in lost
         assert "새로" in lost, "화면 쪽에서는 이어서 할 수 없으니 새로고침을 안내해야 합니다"
+
+
+class TestCallRecordingsInTheBrowser:
+    """웹판도 '통화녹음_이름' 같은 파일은 두 사람으로 본다(최대 2명).
+
+    웹의 묶기는 기준값으로 멈추는 방식이라, 상한을 2로 두면 한 사람을 여럿으로 쪼개는
+    실수를 막으면서 혼잣말 파일은 그대로 한 명으로 남는다.
+    """
+
+    def test_file_name_hint(self):
+        from .test_engines_and_pipeline import CALL_NAME_CASES
+
+        names = json.dumps([name for name, _ in CALL_NAME_CASES], ensure_ascii=False)
+        out = _run_node(f"""
+        const {{ speakerLimitFromFileName }} = await import("{(WEB_DIR / 'diarize.js').as_posix()}");
+        console.log(JSON.stringify({names}.map((n) => speakerLimitFromFileName(n) ?? null)));
+        """)
+        assert json.loads(out) == [expected for _, expected in CALL_NAME_CASES], "PC판과 판단이 다릅니다"
+
+    def test_cap_stops_one_person_from_becoming_three(self):
+        out = _run_node(f"""
+        const {{ clusterByAffinity }} = await import("{(WEB_DIR / 'diarize.js').as_posix()}");
+        const unit = (axis, wobble) => {{ const v = new Float32Array(8); v[axis] = 1; v[7] = wobble;
+          const n = Math.hypot(...v); return v.map((x) => x / n); }};
+        const three = [unit(0, 0), unit(0, 0.1), unit(1, 0), unit(1, 0.1), unit(2, 0), unit(2, 0.1)];
+        const one = [unit(0, 0), unit(0, 0.05), unit(0, 0.1)];
+        const count = (labels) => new Set(labels).size;
+        console.log(JSON.stringify([count(clusterByAffinity(three)), count(clusterByAffinity(three, undefined, 2)),
+                                    count(clusterByAffinity(one, undefined, 2))]));
+        """)
+        assert json.loads(out) == [3, 2, 1]
+
+    def test_the_hint_reaches_the_clustering(self):
+        engine = (WEB_DIR / "engine.js").read_text(encoding="utf-8")
+        diarize = (WEB_DIR / "diarize.js").read_text(encoding="utf-8")
+        html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+        assert "fileName: activeFile.name" in html
+        assert "speakerLimitFromFileName(request.fileName)" in engine
+        assert "options.maxSpeakers" in diarize[diarize.index("export async function assignSpeakers") :]
+
+    def test_user_can_say_how_many_people_spoke(self):
+        """누나와 둘이 한 통화가 화자 6명으로 나왔다(2026-10-07 제보). 인원을 고를 수 있어야 한다."""
+        html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+        select = html[html.index('<select id="speakers"') : html.index("</select>", html.index('<select id="speakers"'))]
+        assert '<option value="" selected>자동</option>' in select
+        for n in range(2, 7):
+            assert f'value="{n}"' in select
+        assert 'maxSpeakers: Number($("speakers").value) || null' in html
+        set_file = html[html.index("function setFile") :]
+        set_file = set_file[: set_file.index("\n}\n")]
+        assert "speakerLimitFromFileName" in set_file, "통화 녹음 파일을 골라도 2명으로 맞춰 주지 않습니다"
+        engine = (WEB_DIR / "engine.js").read_text(encoding="utf-8")
+        assert "request.maxSpeakers || speakerLimitFromFileName(request.fileName)" in engine

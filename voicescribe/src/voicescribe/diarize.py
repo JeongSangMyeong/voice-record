@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -200,6 +201,23 @@ def _silhouette(distances: np.ndarray, labels: list[int]) -> float:
 # --------------------------------------------------------------------------- #
 # 공개 API
 # --------------------------------------------------------------------------- #
+
+
+_CALL_NAME = re.compile(r"통화\s*녹음|전화|(?<![a-z])call(?![a-z])", re.IGNORECASE)
+_GROUP_NAME = re.compile(r"회의|conference|meeting|컨퍼런스", re.IGNORECASE)
+
+
+def speakers_hint_from_name(name: str | Path) -> int | None:
+    """파일 이름으로 인원을 짐작한다. '통화녹음_이름' 같은 통화 녹음이면 2, 모르면 None.
+
+    화자 구분이 틀리는 가장 큰 원인이 인원 추측이라, 알 수 있으면 정해 주는 편이 낫다.
+    '통화정책 회의', '전화회의' 처럼 여럿일 수 있는 이름은 짐작하지 않는다.
+    웹판 diarize.js 의 speakerLimitFromFileName 과 같은 기준이다.
+    """
+    stem = Path(str(name)).name
+    if _GROUP_NAME.search(stem):
+        return None
+    return 2 if _CALL_NAME.search(stem) else None
 
 
 def diarize_simple(

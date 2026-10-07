@@ -576,10 +576,12 @@ export async function runTranscription(request, onEvent) {
     try {
       // 화자 구분도 같은 라이브러리의 목소리 모델을 쓴다. 아직이면 여기서 준비한다.
       if (!libRef) await loadLibrary();
-      const { assignSpeakers } = await import("./diarize.js");
+      const { assignSpeakers, speakerLimitFromFileName } = await import("./diarize.js");
       const labels = await assignSpeakers(audio, chunks, sampleRate, {
         transformers: libRef,
         device,
+        // 사용자가 고른 사람 수가 먼저, 없으면 파일 이름으로 짐작(통화 녹음이면 2명)
+        maxSpeakers: request.maxSpeakers || speakerLimitFromFileName(request.fileName),
         // 목소리 모델(약 26MB)도 처음 한 번은 내려받는다. 같은 진행률 막대를 쓴다.
         onProgress: (item) => {
           if (item.status === "progress" && item.total) {

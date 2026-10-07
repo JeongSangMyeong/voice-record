@@ -40,6 +40,19 @@ const MAX_EMBED_SECONDS = 10;
 let cached = null;
 
 /**
+ * 파일 이름으로 인원 상한을 짐작한다. '통화녹음_이름' 같은 통화 녹음이면 2, 모르면 null.
+ *
+ * 화자 구분이 틀리는 가장 큰 원인이 인원 추측이다. 상한을 2로 두면 한 사람을 여럿으로
+ * 쪼개는 실수를 막고, 혼잣말 파일은 그대로 한 명으로 남는다. '통화정책 회의', '전화회의'
+ * 처럼 여럿일 수 있는 이름은 짐작하지 않는다. PC판 speakers_hint_from_name 과 같은 기준이다.
+ */
+export function speakerLimitFromFileName(name) {
+  const stem = String(name || "").split(/[\\/]/).pop();
+  if (/회의|conference|meeting|컨퍼런스/i.test(stem)) return null;
+  return /통화\s*녹음|전화|(?<![a-z])call(?![a-z])/i.test(stem) ? 2 : null;
+}
+
+/**
  * 목소리 모델을 준비한다.
  *
  * @param {object} lib 이미 불러 둔 @huggingface/transformers 모듈
@@ -226,7 +239,7 @@ export function toSpeakerNames(total, usable, labels) {
  * @param {Float32Array} audio 16kHz 모노 오디오 전체
  * @param {{start:number,end:number}[]} segments 받아쓰기 구간
  * @param {number} sampleRate
- * @param {{transformers?:object, device?:string, onProgress?:Function, onSegment?:Function}} options
+ * @param {{transformers?:object, device?:string, maxSpeakers?:number, onProgress?:Function, onSegment?:Function}} options
  * @returns {Promise<string[]>} 구간과 같은 길이의 화자 이름 배열
  */
 export async function assignSpeakers(audio, segments, sampleRate, options = {}) {
@@ -267,7 +280,7 @@ export async function assignSpeakers(audio, segments, sampleRate, options = {}) 
 
   if (strong.length < 2) return segments.map(() => "화자1");
 
-  const labels = clusterByAffinity(strong.map((s) => s.vector));
+  const labels = clusterByAffinity(strong.map((s) => s.vector), SAME_SPEAKER, options.maxSpeakers || MAX_SPEAKERS);
   const centroids = centroidsOf(strong.map((s) => s.vector), labels);
 
   const judged = strong

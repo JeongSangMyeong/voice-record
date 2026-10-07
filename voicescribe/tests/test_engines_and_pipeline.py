@@ -163,3 +163,59 @@ class TestSaveOutputs:
         assert {p.suffix for p in written} == {".txt", ".srt"}
         assert result.segments
         assert "[00:00.500]" in (tmp_path / "회의녹음.txt").read_text(encoding="utf-8")
+
+
+CALL_NAME_CASES = [
+    ("통화녹음_홍길동.m4a", 2),
+    ("통화 녹음 김철수_241007_101500.m4a", 2),
+    ("Call recording John_241007.m4a", 2),
+    ("Call with Mom.m4a", 2),
+    ("전화_엄마.m4a", 2),
+    ("통화정책 회의.m4a", None),      # '통화' 가 돈(통화정책)일 때
+    ("전화회의_팀.m4a", None),        # 여럿이 하는 전화 회의
+    ("conference call.m4a", None),
+    ("주간회의.m4a", None),
+    ("recall.m4a", None),
+    ("녹음-2026-10-07.m4a", None),
+]
+
+
+class TestCallRecordingHint:
+    """'통화녹음_이름' 같은 파일은 두 사람의 통화다. 인원을 정해 주면 화자 구분이 훨씬 덜 틀린다.
+
+    화자 구분이 틀리는 가장 큰 원인이 인원 추측이다(2026-10-07 사용자 제안).
+    """
+
+    @pytest.mark.parametrize(("name", "expected"), CALL_NAME_CASES)
+    def test_guesses_two_people_only_for_phone_calls(self, name, expected):
+        from voicescribe.diarize import speakers_hint_from_name
+
+        assert speakers_hint_from_name(name) == expected
+
+    def _captured(self, monkeypatch, path, **request_kwargs):
+        import voicescribe.diarize as diarize_module
+        from voicescribe.transcriber import transcribe_buffer
+
+        captured = {}
+
+        def fake_apply(audio, result, **kwargs):
+            captured.update(kwargs)
+            return result
+
+        monkeypatch.setattr(diarize_module, "apply_diarization", fake_apply)
+        audio = load_audio(path)
+        transcribe_buffer(audio, TranscribeRequest(path=path, engine="demo", diarize=True, **request_kwargs))
+        return captured
+
+    def test_call_recordings_are_split_into_exactly_two(self, two_speaker_wav, monkeypatch):
+        call = two_speaker_wav.with_name("통화녹음_홍길동.wav")
+        call.write_bytes(two_speaker_wav.read_bytes())
+        assert self._captured(monkeypatch, call) == {"min_speakers": 2, "max_speakers": 2}
+
+    def test_a_count_the_user_gave_always_wins(self, two_speaker_wav, monkeypatch):
+        call = two_speaker_wav.with_name("통화녹음_홍길동.wav")
+        call.write_bytes(two_speaker_wav.read_bytes())
+        assert self._captured(monkeypatch, call, max_speakers=3) == {"min_speakers": None, "max_speakers": 3}
+
+    def test_other_recordings_are_left_to_guess(self, two_speaker_wav, monkeypatch):
+        assert self._captured(monkeypatch, two_speaker_wav) == {"min_speakers": None, "max_speakers": None}
