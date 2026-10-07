@@ -33,7 +33,7 @@
   .drop:active,.drop.over{border-color:var(--accent);background:var(--accent-weak)}
   .drop b{font-size:16px} .drop small{display:block;color:var(--muted);margin-top:6px}
   label.f{display:block;font-size:13px;color:var(--muted);margin-bottom:4px}
-  select{width:100%;padding:12px 10px;border-radius:10px;border:1px solid var(--line);
+  select,input.text{width:100%;padding:12px 10px;border-radius:10px;border:1px solid var(--line);
          background:var(--bg);color:var(--text);font-size:16px;font-family:inherit}
   button{padding:14px 18px;border-radius:10px;border:1px solid var(--line);background:var(--panel);
          color:var(--text);font-size:16px;font-family:inherit;cursor:pointer;width:100%}
@@ -141,6 +141,31 @@
       <button id="copy">📋 복사</button>
       <button id="save">⬇ 파일로 저장 · 공유</button>
     </div>
+    <button id="aiFix" style="margin-top:10px">✨ AI로 교정 (Claude) — 잘못 들은 단어를 문맥으로 고침</button>
+    <div id="aiPanel" class="hidden" style="margin-top:12px">
+      <div class="note warn">
+        교정하려면 <b>받아쓴 글</b>이 Anthropic(Claude) 서버로 전송됩니다. <b>녹음은 전송되지 않습니다.</b><br />
+        요금은 아래에 넣는 본인 API 키로 청구됩니다(console.anthropic.com 에서 발급).
+      </div>
+      <label class="f" for="aiKey">Anthropic API 키</label>
+      <input id="aiKey" type="password" class="text" autocomplete="off" spellcheck="false" placeholder="sk-ant-..." />
+      <label style="display:flex;align-items:center;gap:8px;margin-top:8px;font-size:14px;cursor:pointer">
+        <input type="checkbox" id="aiRemember" style="width:18px;height:18px" />
+        이 기기에 키 기억하기 (공용 기기에서는 켜지 마세요)
+      </label>
+      <label class="f" for="aiModel" style="margin-top:10px">모델</label>
+      <select id="aiModel">
+        <option value="claude-opus-5-5" selected>Claude Opus 5.5 — 가장 정확</option>
+        <option value="claude-sonnet-5-5">Claude Sonnet 5.5 — 절반 가격</option>
+      </select>
+      <div id="aiCost" class="status"></div>
+      <div class="row" style="margin-top:10px">
+        <button id="aiStart" class="primary">교정 시작</button>
+        <button id="aiCancel">닫기</button>
+      </div>
+    </div>
+    <div id="aiStatus" class="status hidden" style="white-space:pre-wrap"></div>
+    <button id="aiUndo" class="hidden" style="margin-top:8px">↩ 원문으로 되돌리기</button>
   </div>
 
   <p class="foot">
@@ -178,7 +203,7 @@ let mainThreadBusy = false;
 let activeRequest = null;      // 작업자를 재사용하므로 오류 처리기는 늘 '지금' 요청을 봐야 한다
 let activeFile = null;         // 작업을 시작한 파일. 도중에 다른 파일을 골라도 이것을 읽는다
 // 파일을 고칠 때마다 올린다. 브라우저가 예전 파일을 쓰지 않게 하는 용도.
-const APP_VERSION = "26";
+const APP_VERSION = "27";
 
 /* ---------- 보안 연결 확인 (마이크는 https 에서만 된다) ---------- */
 if (!window.isSecureContext) {
@@ -923,9 +948,138 @@ function showResult(d) {
       : "") +
     `모드 <b>${d.device === "webgpu" ? "WebGPU (빠름)" : "일반 (느림)"}</b>` +
     (onMainThread ? `<span style="color:var(--warn)">화면에서 직접 처리(느림)</span>` : "");
+  resetAiFix();
   $("result").classList.remove("hidden");
   $("result").scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
+
+/* ---------- AI 교정 (선택 기능: 받아쓴 글만 Anthropic 으로) ---------- */
+
+// 녹음은 여기서 다루지 않는다. 화면에 보이는 받아쓴 글만, 사용자가 버튼을 누를 때만 보낸다.
+const AI_KEY_STORE = "voicescribe-anthropic-key";
+let aiOriginal = null;        // 교정 전 원문(되돌리기용)
+let aiController = null;      // 진행 중인 교정을 멈출 때 쓴다
+
+function savedAiKey() {
+  try { return localStorage.getItem(AI_KEY_STORE) || ""; } catch { return ""; }
+}
+
+function resetAiFix() {
+  aiController?.abort();
+  aiController = null;          // 멈춘 실행은 이제 결과를 화면에 넣지 않는다(aiStart 참고)
+  aiOriginal = null;
+  $("aiPanel").classList.add("hidden");
+  $("aiStatus").classList.add("hidden");
+  $("aiUndo").classList.add("hidden");
+  $("aiFix").disabled = false;
+  $("aiStart").disabled = false;
+  $("aiCancel").textContent = "닫기";
+}
+
+async function updateAiCost() {
+  try {
+    const { estimateCost } = await import(`./correct.js?v=${APP_VERSION}`);
+    const chars = $("out").value.length;
+    const cost = estimateCost(chars, $("aiModel").value);
+    $("aiCost").textContent = `글자 ${chars.toLocaleString()}자 · 예상 비용 어림 $${cost.toFixed(2)} (실제와 다를 수 있음)`;
+  } catch {
+    $("aiCost").textContent = "";
+  }
+}
+
+$("aiFix").addEventListener("click", () => {
+  const key = savedAiKey();
+  if (key) {
+    $("aiKey").value = key;
+    $("aiRemember").checked = true;
+  }
+  $("aiPanel").classList.remove("hidden");
+  updateAiCost();
+});
+$("aiModel").addEventListener("change", updateAiCost);
+
+$("aiCancel").addEventListener("click", () => {
+  if (aiController) { aiController.abort(); return; }   // 교정 중이면 멈춘다
+  $("aiPanel").classList.add("hidden");
+});
+
+$("aiRemember").addEventListener("change", () => {
+  // 끄는 순간 바로 잊는다(다음 교정을 기다리지 않는다).
+  if (!$("aiRemember").checked) {
+    try { localStorage.removeItem(AI_KEY_STORE); } catch { /* 저장소가 막혀 있으면 지울 것도 없다 */ }
+  }
+});
+
+$("aiStart").addEventListener("click", async () => {
+  const apiKey = $("aiKey").value.trim();
+  if (!apiKey) {
+    $("aiStatus").classList.remove("hidden");
+    $("aiStatus").textContent = "Anthropic API 키를 넣어 주세요.";
+    return;
+  }
+  try {
+    if ($("aiRemember").checked) localStorage.setItem(AI_KEY_STORE, apiKey);
+    else localStorage.removeItem(AI_KEY_STORE);
+  } catch { /* 저장소가 막혀도 이번 교정은 된다 */ }
+
+  // 이 실행의 것만 붙잡는다. 앞선 실행이 늦게 끝나도 지금 실행을 건드리지 않게.
+  const controller = new AbortController();
+  aiController = controller;
+  $("aiStart").disabled = true;
+  $("aiFix").disabled = true;
+  $("aiUndo").classList.add("hidden");   // 교정 중에 되돌리면 곧 덮어써진다
+  $("aiCancel").textContent = "■ 멈추기";
+  $("aiStatus").classList.remove("hidden");
+  $("aiStatus").textContent = "교정 준비 중…";
+  const original = $("out").value;
+  const apply = (text) => {
+    if (aiOriginal === null) aiOriginal = original;   // 두 번 교정해도 처음 원문으로 돌아간다
+    $("out").value = text;
+    $("aiUndo").classList.remove("hidden");
+  };
+  try {
+    const { proofread } = await import(`./correct.js?v=${APP_VERSION}`);
+    const result = await proofread($("out").value, {
+      apiKey,
+      model: $("aiModel").value,
+      signal: controller.signal,
+      onProgress: (done, total) => {
+        if (aiController === controller) $("aiStatus").textContent = `교정하는 중… ${done}/${total} 부분`;
+      },
+    });
+    // 그사이 새 받아쓰기 결과가 나왔으면(resetAiFix) 이 결과로 덮어쓰지 않는다.
+    if (aiController !== controller) return;
+    apply(result.text);
+    $("aiPanel").classList.add("hidden");
+    $("aiStatus").textContent =
+      "✅ 교정했습니다. 복사·저장하면 교정한 글이 나갑니다." +
+      (result.kept ? ` (${result.kept}부분은 확신이 없어 원문 그대로 두었습니다)` : "");
+  } catch (error) {
+    if (aiController !== controller) return;   // 위와 같다
+    // 도중에 멈추거나 실패해도 이미 교정한 부분은 살린다(그 부분은 이미 요금이 나갔다).
+    const partial = error?.partial;
+    const salvaged = partial && partial.done > 0;
+    if (salvaged) apply(partial.text);
+    $("aiStatus").textContent =
+      "❌ " + (error?.message || error) +
+      (salvaged ? `\n${partial.done}/${partial.total} 부분까지 교정한 글을 넣어 두었습니다. 나머지는 원문 그대로입니다.` : "");
+  } finally {
+    if (aiController === controller) {
+      aiController = null;
+      $("aiStart").disabled = false;
+      $("aiFix").disabled = false;
+      $("aiCancel").textContent = "닫기";
+    }
+  }
+});
+
+$("aiUndo").addEventListener("click", () => {
+  if (aiOriginal === null) return;
+  $("out").value = aiOriginal;
+  aiOriginal = null;
+  $("aiUndo").classList.add("hidden");
+  $("aiStatus").textContent = "원문으로 되돌렸습니다.";
+});
 
 $("copy").addEventListener("click", async () => {
   try {

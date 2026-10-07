@@ -2,7 +2,7 @@
 
 녹음 파일을 텍스트로 바꾸는 도구다. 두 가지 방식으로 쓴다.
 
-1. **휴대폰·브라우저용** — 최상위의 `index.html`, `engine.js`, `worker.js`, `diarize.js`.
+1. **휴대폰·브라우저용** — 최상위의 `index.html`, `engine.js`, `worker.js`, `diarize.js`, `correct.js`.
    GitHub Pages 로 그대로 서비스된다. 모델을 브라우저가 직접 받아 기기 안에서 돌린다.
 2. **PC용** — `voicescribe/`. 파이썬 패키지이며 CLI·웹 UI·MCP 서버를 담고 있다.
 
@@ -14,6 +14,10 @@
 **녹음 파일은 기기 밖으로 나가지 않는다.** 이 도구의 존재 이유다.
 `fetch` 는 모델을 받을 때만 쓰고, 보내는 내용(body)이 있어서는 안 된다.
 `test_never_uploads_audio` 가 이를 검사한다.
+
+유일한 예외는 선택 기능 'AI 교정'(`correct.js`, 2026-10-07 사용자 결정)이다. 받아쓴 **글**만,
+사용자가 버튼을 누르고 자기 API 키를 넣었을 때만 Anthropic 으로 보낸다. 녹음(소리)은 이 경로로도
+나가지 않는다. `TestAiProofreading` 이 이 경계를 검사한다.
 
 ## VoiceScribe(PC판) 빠른 시작
 

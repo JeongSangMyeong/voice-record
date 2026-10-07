@@ -606,7 +606,7 @@ class TestBrowserOnlyWebApp:
         둘이 어긋나면 검사를 통과했는데도 사용자에게는 옛 파일이 간다.
         """
         root = WEB_DIR.parent.parent.parent
-        for name in ("index.html", "engine.js", "diarize.js", "worker.js",
+        for name in ("index.html", "engine.js", "diarize.js", "worker.js", "correct.js",
                      "coi-serviceworker.js", "manifest.json",
                      "icon-192.png", "icon-512.png", "apple-touch-icon.png"):
             here, there = root / name, WEB_DIR / name
@@ -740,7 +740,7 @@ class TestBrowserOnlyWebApp:
         assert "catch" in engine[index : index + 1500]
 
     def test_required_files_exist(self):
-        for name in ("index.html", "worker.js", "engine.js", "diarize.js", "올리는방법.md"):
+        for name in ("index.html", "worker.js", "engine.js", "diarize.js", "correct.js", "올리는방법.md"):
             assert (WEB_DIR / name).exists(), f"{name} 이 없습니다"
 
     def test_falls_back_to_the_main_thread(self):
@@ -772,7 +772,7 @@ class TestBrowserOnlyWebApp:
         모델을 내려받으려면 fetch 가 필요하므로 무조건 금지할 수는 없다.
         대신 모든 요청이 (1) 알려진 모델 주소이고 (2) 보내는 내용이 없는지 본다.
         """
-        files = ["index.html", "worker.js", "engine.js", "diarize.js"]
+        files = ["index.html", "worker.js", "engine.js", "diarize.js", "correct.js"]
         allowed = ("huggingface.co", "cdn.jsdelivr.net", "unpkg.com", "./", "`${")
         for name in files:
             path = WEB_DIR / name
@@ -1070,3 +1070,164 @@ class TestIphoneDoesNotReload:
         lost = engine[engine.index("if (device === \"webgpu\" && isDeviceLost(error))") :][:500]
         assert "transcriber = null" in lost and "loadedKey = null" in lost
         assert "새로" in lost, "화면 쪽에서는 이어서 할 수 없으니 새로고침을 안내해야 합니다"
+
+
+class TestAiProofreading:
+    """받아쓴 글을 Claude 로 교정하는 선택 기능(2026-10-07 사용자 요청).
+
+    녹음(소리)은 여전히 기기 밖으로 나가지 않는다. 받아쓴 '글' 만, 사용자가 버튼을 누르고
+    자기 API 키를 넣었을 때만 Anthropic 으로 간다. 이 경계를 검사로 지킨다.
+    """
+
+    def _node(self, body: str) -> str:
+        path = (WEB_DIR / "correct.js").as_posix()
+        return _run_node(f'const m = await import("{path}");\n{body}')
+
+    def test_splitting_keeps_every_character_and_respects_the_size(self):
+        """긴 회의록은 나눠 보낸다. 나눈 조각을 이으면 원문과 한 글자도 달라선 안 된다."""
+        out = self._node("""
+        const speakers = Array.from({ length: 40 }, (_, i) =>
+          `[화자${(i % 3) + 1}]\\n` + "오늘 회의에서는 한도 모형의 항목들을 정리하겠습니다. ".repeat(6)).join("\\n\\n");
+        const oneLine = "근데 이제 투비 한도에서는 자동심사 한도 대상 원장으로부터 시작합니다. ".repeat(150);
+        const english = "So in college I was a government major, which means I wrote a lot of papers. ".repeat(80);
+        const rows = [speakers, oneLine, english, "짧은 글"].map((text) => {
+          const parts = m.splitForProofreading(text, 2500);
+          return { same: parts.join("") === text, longest: Math.max(...parts.map((p) => p.length)), count: parts.length };
+        });
+        console.log(JSON.stringify(rows));
+        """)
+        rows = json.loads(out)
+        for row in rows:
+            assert row["same"], "나눈 조각을 이었더니 원문과 다릅니다"
+            assert row["longest"] <= 2500
+        assert all(r["count"] > 1 for r in rows[:3]) and rows[3]["count"] == 1
+
+    def test_refuses_anything_but_text(self):
+        """교정 함수에 소리 데이터가 들어오면 보내기 전에 막는다."""
+        out = self._node("""
+        const results = [];
+        for (const bad of [new Float32Array(16), new Blob(["x"]), null]) {
+          try { await m.proofread(bad, { apiKey: "sk-test", model: "claude-opus-5-5" }); results.push("sent"); }
+          catch (error) { results.push("blocked"); }
+        }
+        console.log(JSON.stringify(results));
+        """)
+        assert json.loads(out) == ["blocked", "blocked", "blocked"]
+
+    def test_cost_estimate_follows_the_price_table(self):
+        out = self._node("""
+        console.log(JSON.stringify({
+          opus: m.estimateCost(15000, "claude-opus-5-5"),
+          sonnet: m.estimateCost(15000, "claude-sonnet-5-5"),
+        }));
+        """)
+        cost = json.loads(out)
+        assert 0.1 < cost["opus"] < 2.0, cost
+        assert abs(cost["sonnet"] / cost["opus"] - 0.5) < 0.01, "Sonnet 5.5 는 Opus 5.5 의 절반 가격입니다"
+
+    def test_rewritten_output_is_not_accepted(self):
+        """요약하거나 설명을 덧붙여 길이가 크게 달라진 결과는 받지 않고 원문을 둔다."""
+        out = self._node("""
+        const original = "회의에서 나온 이야기를 그대로 적은 글입니다. ".repeat(20);
+        console.log(JSON.stringify([
+          m.looksRewritten(original, original.slice(0, 200)),
+          m.looksRewritten(original, original + "교정 내용 설명: ".repeat(60)),
+          m.looksRewritten(original, original.replace("이야기", "얘기")),
+        ]));
+        """)
+        assert json.loads(out) == [True, True, False]
+
+    def test_prompt_keeps_what_was_said(self):
+        js = (WEB_DIR / "correct.js").read_text(encoding="utf-8")
+        prompt = js[js.index("export const SYSTEM_PROMPT") :]
+        prompt = prompt[: prompt.index("`;")]
+        for must in ("요약", "[화자", "확신", "영어"):
+            assert must in prompt, f"교정 지시에 '{must}' 규칙이 없습니다"
+
+    def test_uses_the_official_sdk_with_a_safe_default_setup(self):
+        js = (WEB_DIR / "correct.js").read_text(encoding="utf-8")
+        assert re.search(r"@anthropic-ai/sdk@\d+\.\d+\.\d+", js), "SDK 버전을 고정하지 않았습니다"
+        assert "dangerouslyAllowBrowser: true" in js
+        assert '"claude-opus-5-5"' in js and '"claude-sonnet-5-5"' in js
+        assert 'fallbacks: "default"' in js and "server-side-fallback-2026-07-01" in js
+        assert "finalMessage()" in js and "stop_reason" in js
+        # 사람이 알아들을 오류 문구(해결 방법 포함)
+        for status in ("AuthenticationError", "RateLimitError", "APIConnectionError"):
+            assert status in js
+
+    def test_page_sends_only_the_text_and_only_on_a_click(self):
+        html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+        start = html[html.index('$("aiStart").addEventListener("click"') :]
+        start = start[: start.index("\n});\n")]
+        assert 'proofread($("out").value' in start, "받아쓴 글 말고 다른 것을 보낼 수 있습니다"
+        panel = html[html.index('id="aiPanel"') :][:1500]
+        assert "녹음은 전송되지 않" in panel and "Anthropic" in panel, "무엇이 어디로 가는지 알리지 않습니다"
+        assert 'id="aiKey" type="password"' in html
+        assert 'id="aiRemember"' in html and 'id="aiRemember" checked' not in html, "키 기억은 사용자가 고를 때만"
+        assert 'id="aiUndo"' in html, "원문으로 되돌릴 수 없습니다"
+
+    def test_proofreading_code_never_touches_audio(self):
+        js = (WEB_DIR / "correct.js").read_text(encoding="utf-8")
+        code = re.sub(r"/\*.*?\*/|//[^\n]*", "", js, flags=re.S)   # 주석은 빼고 코드만 본다
+        for banned in ("audio", "Float32Array(", "getChannelData", "arrayBuffer", "FormData", "XMLHttpRequest"):
+            assert banned not in code, f"교정 코드에 소리를 다룰 수 있는 코드가 있습니다: {banned}"
+
+    def test_echoed_context_or_tags_are_not_pasted_into_the_transcript(self):
+        """모델이 참고용 앞부분을 되풀이하면 회의록에 같은 말이 두 번 들어간다(길이 검사로는 못 잡는다)."""
+        out = self._node("""
+        const context = "앞에서 이미 교정한 부분입니다. 한도 모형의 항목들을 정리했습니다. ".repeat(10);
+        const fixed = "이번 조각을 교정한 글입니다. 항목들은 여기서 만들어집니다.";
+        console.log(JSON.stringify([
+          m.extractCorrection(fixed, context),
+          m.extractCorrection("<교정할_글>\\n" + fixed + "\\n</교정할_글>", context),
+          m.extractCorrection(context + fixed, context),
+          m.extractCorrection("<앞부분>\\n" + context + "\\n</앞부분>\\n" + fixed, context),
+          m.extractCorrection(fixed, ""),
+          // 같은 말을 되풀이하는 회의: 앞부분과 같은 문장이 가운데에 있어도 받아들인다
+          m.extractCorrection("[화자2]\\n" + context.slice(0, 120), context, "[화자2]\\n" + context.slice(0, 120)),
+        ]));
+        """)
+        good = "이번 조각을 교정한 글입니다. 항목들은 여기서 만들어집니다."
+        rows = json.loads(out)
+        assert rows[:5] == [good, good, None, None, good]
+        assert rows[5] is not None, "되풀이가 아닌데 버렸습니다(같은 말을 반복하는 회의에서 교정이 빠진다)"
+
+    def test_work_already_paid_for_survives_an_error_or_stop(self):
+        """30조각 중 20번째에서 서버가 붐비거나 사용자가 멈춰도, 끝난 19조각은 버리지 않는다."""
+        js = (WEB_DIR / "correct.js").read_text(encoding="utf-8")
+        assert ".partial = " in js
+        html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+        start = html[html.index('$("aiStart").addEventListener("click"') :]
+        start = start[: start.index("\n});\n")]
+        assert "error?.partial" in start, "도중에 멈추면 교정한 부분을 버립니다"
+
+    def test_undo_always_returns_to_the_true_original(self):
+        html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+        assert "if (aiOriginal === null) aiOriginal = original;" in html
+
+    def test_an_old_run_cannot_cancel_a_newer_one(self):
+        html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+        start = html[html.index('$("aiStart").addEventListener("click"') :]
+        start = start[: start.index("\n});\n")]
+        assert "const controller = new AbortController();" in start
+        assert "if (aiController === controller)" in start
+
+    def test_sdk_download_failure_is_explained_in_korean(self):
+        js = (WEB_DIR / "correct.js").read_text(encoding="utf-8")
+        body = js[js.index("export async function proofread") :]
+        assert "cdn.jsdelivr.net" in body or "불러오지 못했습니다" in body
+        assert "불러오지 못했습니다" in body
+
+    def test_unticking_remember_forgets_the_key_at_once(self):
+        html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+        handler = html[html.index('$("aiRemember").addEventListener("change"') :][:300]
+        assert "removeItem(AI_KEY_STORE)" in handler
+
+    def test_a_new_transcript_is_never_overwritten_by_an_old_correction(self):
+        """교정 중에 새 받아쓰기 결과가 나오면, 늦게 끝난 옛 교정이 새 결과를 덮어쓰면 안 된다."""
+        html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+        start = html[html.index('$("aiStart").addEventListener("click"') :]
+        start = start[: start.index("\n});\n")]
+        assert start.count("if (aiController !== controller) return;") >= 2
+        assert "resetAiFix();" in html[html.index("function showResult") :]
+
