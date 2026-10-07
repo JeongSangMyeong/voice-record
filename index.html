@@ -107,7 +107,7 @@
           <option value="onnx-community/whisper-base">작음 — 빠름</option>
           <option value="onnx-community/whisper-tiny">아주 작음 — 가장 빠름</option>
         </select>
-        <div class="status" style="margin-top:6px">
+        <div id="modelNote" class="status" style="margin-top:6px">
           제대로 받아쓰려면 <b>맨 위 큼</b> 을 쓰세요. 처음 한 번만 받고 이후엔 저장됩니다.
         </div>
       </div>
@@ -175,8 +175,10 @@ let onMainThread = false;
 let cancelled = false;
 let workerFailed = false;      // 작업자가 한 번 실패하면 이후에는 바로 우회한다
 let mainThreadBusy = false;
+let activeRequest = null;      // 작업자를 재사용하므로 오류 처리기는 늘 '지금' 요청을 봐야 한다
+let activeFile = null;         // 작업을 시작한 파일. 도중에 다른 파일을 골라도 이것을 읽는다
 // 파일을 고칠 때마다 올린다. 브라우저가 예전 파일을 쓰지 않게 하는 용도.
-const APP_VERSION = "25";
+const APP_VERSION = "26";
 
 /* ---------- 보안 연결 확인 (마이크는 https 에서만 된다) ---------- */
 if (!window.isSecureContext) {
@@ -199,7 +201,7 @@ const fmtSize = (b) => b < 1048576 ? `${(b/1024)|0} KB` : `${(b/1048576).toFixed
 function setFile(f) {
   picked = f;
   $("picked").textContent = f ? `선택됨: ${f.name} (${fmtSize(f.size)})` : "";
-  $("go").disabled = !f;
+  $("go").disabled = !f || window.__transcribing;   // 작업 중에 고르면 다음 작업으로 미룬다
 }
 
 /* ---------- 파일 고르기 ---------- */
@@ -251,37 +253,39 @@ $("recBtn").addEventListener("click", async () => {
 
 /* ---------- 오디오 디코딩 (16kHz 모노로) ---------- */
 async function toMono16k(file) {
-  const buffer = await file.arrayBuffer();
-  const Ctx = window.AudioContext || window.webkitAudioContext;
-  const decodeCtx = new Ctx();
+  // decodeAudioData 는 그 컨텍스트의 샘플레이트로 맞춰 디코딩한다. 16kHz 컨텍스트에 맡기면
+  // 처음부터 16kHz 로 나온다. 예전처럼 48kHz 로 펼쳤다가 줄이면 1시간 스테레오가 1.3GB 라
+  // 아이폰에서는 이 단계만으로 탭 메모리 한도(약 1.5GB)에 닿는다.
+  const Offline = window.OfflineAudioContext || window.webkitOfflineAudioContext;
   let decoded;
   try {
-    decoded = await decodeCtx.decodeAudioData(buffer);
+    decoded = await new Offline(1, 1, SAMPLE_RATE).decodeAudioData(await file.arrayBuffer());
   } catch {
     throw new Error("이 오디오 형식을 읽지 못했습니다. m4a·mp3·wav 파일을 사용해 주세요.");
-  } finally {
-    decodeCtx.close();
   }
-  if (decoded.sampleRate === SAMPLE_RATE && decoded.numberOfChannels === 1) {
-    return decoded.getChannelData(0);
+  if (decoded.numberOfChannels === 1) return decoded.getChannelData(0);
+  // 채널이 여럿이면 평균 내어 하나로 합친다.
+  const mono = new Float32Array(decoded.length);
+  for (let c = 0; c < decoded.numberOfChannels; c++) {
+    const channel = decoded.getChannelData(c);
+    for (let i = 0; i < mono.length; i++) mono[i] += channel[i] / decoded.numberOfChannels;
   }
-  // 16kHz 모노로 다시 그린다.
-  const frames = Math.ceil(decoded.duration * SAMPLE_RATE);
-  const Offline = window.OfflineAudioContext || window.webkitOfflineAudioContext;
-  const offline = new Offline(1, frames, SAMPLE_RATE);
-  const source = offline.createBufferSource();
-  source.buffer = decoded;
-  source.connect(offline.destination);
-  source.start();
-  return (await offline.startRendering()).getChannelData(0);
+  return mono;
 }
 
 /* ---------- 실행 ---------- */
 /** 이 기기가 빠른 모드(WebGPU)를 쓸 수 있는지 미리 확인해 안내한다. */
 let hasWebGPU = null;
 async function checkDevice() {
+  let eng = null;
   try {
-    hasWebGPU = "gpu" in navigator && !!(await navigator.gpu.requestAdapter());
+    eng = await import(`./engine.js?v=${APP_VERSION}`);
+  } catch {
+    /* 못 읽어도 안내 문구만 덜 자세해질 뿐이다 */
+  }
+  try {
+    // 웹킷(아이폰·사파리)은 그래픽 가속이 없는 판을 쓴다(engine.js 의 useWebKitSafeBuild).
+    hasWebGPU = !eng?.isWebKit() && "gpu" in navigator && !!(await navigator.gpu.requestAdapter());
   } catch {
     hasWebGPU = false;
   }
@@ -289,18 +293,76 @@ async function checkDevice() {
   const cores = navigator.hardwareConcurrency || 0;
   const threads = window.crossOriginIsolated ? Math.max(1, Math.min(4, cores)) : 1;
   // 내려받는 용량은 기기(그래픽 가속 여부)에 따라 다르다. 실제 값을 읽어 온다.
-  try {
-    const eng = await import(`./engine.js?v=${APP_VERSION}`);
+  if (eng) {
     profileKey = await eng.pickProfileKey(hasWebGPU ? "webgpu" : "wasm");
     modelSizes = eng.MODEL_PROFILES;
-  } catch {
-    /* 못 읽어도 안내 문구만 덜 자세해질 뿐이다 */
+    adaptModelsToPhone(eng);
   }
+  recoverFromKilledPage();   // 모델 목록을 기기에 맞춘 뒤에 해야 한 단계 낮출 대상이 맞다
   $("devinfo").textContent =
     `이 기기: ${hasWebGPU ? "빠른 모드(WebGPU) 사용 가능" : "일반 모드"}` +
     ` · CPU ${cores || "?"}개 중 ${threads}개 사용` +
-    (window.crossOriginIsolated ? "" : " (여러 개를 쓰려면 새로고침이 한 번 필요합니다)");
+    // 웹킷은 새로고침해도 여러 개를 쓸 수 없다(coi-serviceworker.js 참고). 그 안내는 빼야 맞다.
+    (window.crossOriginIsolated || eng?.isWebKit() ? "" : " (여러 개를 쓰려면 새로고침이 한 번 필요합니다)");
   updateModelHint();
+}
+
+/**
+ * 아이폰·아이패드에서는 '큼' 을 뺀다.
+ *
+ * 실측 메모리가 +4GB 로, 사파리 탭 한도(약 1.5GB)를 훨씬 넘는다. 고르면 사파리가
+ * 페이지를 강제로 끄고 다시 연다. 들어가는 것 중에서는 '보통' 이 가장 정확하다.
+ */
+function adaptModelsToPhone(eng) {
+  if (!eng.isAppleMobile(navigator.userAgent, navigator.platform, navigator.maxTouchPoints)) return;
+  $("model").querySelector('option[value="onnx-community/whisper-large-v3-turbo"]')?.remove();
+  const small = $("model").querySelector('option[value="onnx-community/whisper-small"]');
+  if (small) {
+    small.textContent = "✅ 보통 — 이 기기 권장";
+    $("model").value = small.value;
+  }
+  $("modelNote").textContent =
+    "아이폰·아이패드는 메모리 한도 때문에 가장 큰 모델을 쓸 수 없습니다. " +
+    "'보통' 이 이 기기에서 가장 정확합니다.";
+}
+
+/* ---------- 강제로 다시 열린 페이지 알아채기 ---------- */
+
+// 사파리는 메모리를 너무 쓰는 탭을 강제로 끄고 다시 연다. 그러면 사용자는 아무 설명 없이
+// 처음 화면을 보게 된다. 작업을 시작할 때 표시를 남기고 끝나면 지워서, 다시 열렸을 때
+// 표시가 남아 있으면 이유와 대책을 알린다.
+const WORK_MARK = "voicescribe-working";
+const SMALLER_MODEL = {
+  "onnx-community/whisper-large-v3-turbo": "onnx-community/whisper-small",
+  "onnx-community/whisper-small": "onnx-community/whisper-base",
+  "onnx-community/whisper-base": "onnx-community/whisper-tiny",
+};
+
+function setWorkMark(model) {
+  try { sessionStorage.setItem(WORK_MARK, model); } catch { /* 저장소가 막혀도 받아쓰기는 된다 */ }
+}
+
+function clearWorkMark() {
+  try { sessionStorage.removeItem(WORK_MARK); } catch { /* 위와 같다 */ }
+}
+
+function recoverFromKilledPage() {
+  let model = null;
+  try { model = sessionStorage.getItem(WORK_MARK); } catch { /* 위와 같다 */ }
+  if (!model) return;
+  clearWorkMark();
+  const smaller = SMALLER_MODEL[model];
+  const available = [...$("model").options].some((o) => o.value === smaller);
+  if (available) $("model").value = smaller;
+  const box = $("err");
+  box.className = "note warn";
+  box.classList.remove("hidden");
+  box.textContent =
+    "지난번 받아쓰기가 끝나기 전에 페이지가 다시 열렸습니다.\n" +
+    "대개 휴대폰 메모리가 모자라 브라우저가 페이지를 강제로 닫았을 때 생깁니다.\n" +
+    (available
+      ? "그래서 '정확도' 를 한 단계 낮춰 두었습니다. 파일을 다시 골라 시작해 주세요."
+      : "다른 앱을 닫고, 짧은 녹음으로 먼저 시도해 주세요.");
 }
 
 /** 이 기기에서 이 모델을 고르면 실제로 몇 MB 를 받는지. 모르면 null. */
@@ -339,6 +401,10 @@ checkDevice();
 
 $("go").addEventListener("click", async () => {
   if (!picked) return;
+  // 소리를 읽는 동안에도 메모리를 크게 쓴다. 여기서부터 표시를 남기고 새로고침을 막는다.
+  window.__transcribing = true;
+  activeFile = picked;
+  setWorkMark($("model").value);
   $("go").disabled = true;
   $("err").classList.add("hidden");
   $("err").className = "note err";
@@ -349,7 +415,7 @@ $("go").addEventListener("click", async () => {
 
   let audio;
   try {
-    audio = await toMono16k(picked);
+    audio = await toMono16k(activeFile);
   } catch (e) { return showError(e.message); }
 
   if (audio.length < SAMPLE_RATE * 0.2) return showError("소리가 너무 짧습니다.");
@@ -364,6 +430,8 @@ $("go").addEventListener("click", async () => {
         "취소를 누르면 멈춥니다. ('정확도' 를 낮추면 훨씬 가볍습니다)",
     );
     if (!ok) {
+      window.__transcribing = false;
+      clearWorkMark();
       $("prog").classList.add("hidden");
       $("go").disabled = false;
       return;
@@ -380,7 +448,6 @@ $("go").addEventListener("click", async () => {
 
   leftDuringWork = false;
   cancelled = false;
-  window.__transcribing = true;   // 작업이 끝날 때까지 페이지를 새로고침하지 않는다
   diarizeSkipped = false;
   currentPhase = "";
   downloadBytes.clear();
@@ -639,16 +706,24 @@ function startWithWorker(request) {
     worker.addEventListener("error", () => {
       killWorker();
       workerFailed = true;
+      if (!activeRequest) return;               // 하던 작업이 없으면 다시 할 것도 없다
       $("statusText").textContent = "다른 방식으로 다시 시도합니다…";
-      runOnMainThread(request);           // 원인을 따지지 말고 우회한다
+      runOnMainThread(activeRequest);           // 원인을 따지지 말고 우회한다
     });
     worker.addEventListener("messageerror", () => {
       killWorker();
       workerFailed = true;
-      runOnMainThread(request);
+      if (activeRequest) runOnMainThread(activeRequest);
     });
   }
-  worker.postMessage(request);
+  activeRequest = request;
+  // 소리는 복사하지 않고 넘긴다. 복사하면 같은 소리가 메모리에 두 벌 남는다.
+  // 넘기면 이쪽 소리는 비므로, 대비 경로(runOnMainThread)는 파일을 다시 읽는다.
+  try {
+    worker.postMessage(request, [request.audio.buffer]);
+  } catch {
+    worker.postMessage(request);   // 넘길 수 없는 버퍼면 복사한다
+  }
   return true;
 }
 
@@ -658,6 +733,9 @@ async function runOnMainThread(request) {
   mainThreadBusy = true;
   onMainThread = true;
   try {
+    // 작업자에게 소리를 넘겼다면 이쪽 소리는 비어 있다. 파일에서 다시 읽는다.
+    if (!request.audio?.length) request = { ...request, audio: await toMono16k(activeFile) };
+    activeRequest = request;
     const { runTranscription } = await import(`./engine.js?v=${APP_VERSION}`);
     const result = await runTranscription(request, (e) => onWorker({ data: e }));
     onWorker({ data: result });
@@ -713,7 +791,10 @@ function onWorker(event) {
   } else if (d.type === "phase") {
     currentPhase = d.phase;
     if (d.phase === "loading") {
-      $("statusText").textContent = "모델 준비 중…";
+      // 이어서 하는 중이면 왜 모델을 다시 준비하는지 알려 준다(일반 모드용 파일을 받는다).
+      $("statusText").textContent = activeRequest?.resume
+        ? "그래픽 가속이 끊겨 일반 모드로 이어서 합니다… 모델 준비 중"
+        : "모델 준비 중…";
     } else if (d.phase === "transcribing") {
       // 여기서 화면 꺼짐 방지를 풀면 안 된다. 받아쓰기가 제일 오래 걸리는데
       // 그 사이에 화면이 자동으로 꺼지면 작업이 멈춘다(아이폰은 특히 빨리).
@@ -725,9 +806,6 @@ function onWorker(event) {
     } else if (d.phase === "diarizing") {
       $("fill").style.width = "90%";
       $("statusText").textContent = "화자를 구분하는 중…";
-    } else if (d.phase === "gpu-lost") {
-      // 배경에 오래 있으면 안드로이드가 그래픽 메모리를 회수해 간다.
-      $("statusText").textContent = "그래픽 가속이 끊겨 일반 모드로 이어서 합니다…";
     } else if (d.phase === "retrying") {
       $("statusText").textContent = "다른 방식으로 다시 시도합니다…";
     } else if (d.phase === "diarize-skipped") {
@@ -736,6 +814,15 @@ function onWorker(event) {
       $("statusText").textContent = "화자 구분을 하지 못했습니다 (받아쓰기는 그대로 나옵니다)";
     }
     armStallNotice();
+  } else if (d.type === "gpu-lost") {
+    // 배경에 오래 있으면 안드로이드가 그래픽 메모리를 회수해 간다. 같은 작업자에서는
+    // 다시 돌릴 수 없어(engine.js 의 isDeviceLost 참고) 새 작업자를 띄워 일반 모드로,
+    // 끊긴 구간부터 이어서 한다. 소리는 작업자가 돌려준 것을 쓴다.
+    killWorker();
+    $("statusText").textContent = "그래픽 가속이 끊겨 일반 모드로 이어서 합니다…";
+    armStallNotice();
+    const next = { ...activeRequest, audio: d.audio, forceDevice: "wasm", resume: d.resume };
+    if (!startWithWorker(next)) runOnMainThread(next);
   } else if (d.type === "done") {
     $("fill").style.width = "100%";
     showResult(d);
@@ -769,6 +856,8 @@ function formatResult(d) {
 
 $("stop").addEventListener("click", () => {
   window.__transcribing = false;
+  activeRequest = null;
+  clearWorkMark();
   stopKeepAlive();
   cancelled = true;
   killWorker();                 // 작업자를 즉시 끝낸다
@@ -794,6 +883,8 @@ function killWorker() {
 
 function showError(message) {
   window.__transcribing = false;
+  activeRequest = null;          // 끝난 작업의 소리를 붙잡고 있지 않는다
+  clearWorkMark();
   stopKeepAlive();
   if (wantsNotice()) showNotice("받아쓰기가 중간에 멈췄습니다", friendlyError(message).split("\n")[0]);
   releaseAwake();
@@ -805,6 +896,8 @@ function showError(message) {
 
 function showResult(d) {
   window.__transcribing = false;
+  activeRequest = null;
+  clearWorkMark();
   stopKeepAlive();
   if (wantsNotice()) {
     showNotice(

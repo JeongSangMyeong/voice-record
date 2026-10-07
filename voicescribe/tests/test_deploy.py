@@ -858,3 +858,215 @@ class TestBrowserOnlyWebApp:
         assert "GitHub Pages" in guide
         assert "Cloudflare" in guide
         assert "file://" in guide  # 파일 직접 열기가 안 된다는 안내
+
+
+def _run_node(script: str) -> str:
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node 가 없어 건너뜁니다")
+    result = subprocess.run(
+        [node, "--input-type=module", "-e", script],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert result.returncode == 0, result.stderr
+    return result.stdout.strip().splitlines()[-1]
+
+
+class TestIphoneDoesNotReload:
+    """아이폰에서 파일을 올리면 '로딩하다가 새로고침' 되던 문제(2026-10-07 제보).
+
+    사파리는 메모리를 너무 쓰는 탭을 강제로 끄고 다시 연다. 원인이 둘 겹쳐 있었다.
+      1) 작업자 안에서는 navigator.vendor 가 없어(웹킷 NavigatorID.idl 의 [Exposed=Window])
+         라이브러리가 사파리를 못 알아보고 asyncify 판을 고른다. 이 판은 iOS 26.2 이후
+         웹킷 JIT 메모리 폭주 버그를 일으킨다(onnxruntime#26827, WebKit 304810).
+      2) '큼' 모델은 실측 메모리 +4GB. 아이폰 탭 한도는 약 1.5GB 다.
+    """
+
+    def test_webkit_is_recognised_inside_a_worker(self):
+        """아이폰의 크롬·파이어폭스도 속은 웹킷이라 같은 대우를 받아야 한다."""
+        engine = (WEB_DIR / "engine.js").as_posix()
+        out = _run_node(f"""
+        const {{ isWebKit, isAppleMobile }} = await import("{engine}");
+        const ua = {{
+          iphoneSafari: "Mozilla/5.0 (iPhone; CPU iPhone OS 26_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.1 Mobile/15E148 Safari/604.1",
+          iphoneChrome: "Mozilla/5.0 (iPhone; CPU iPhone OS 26_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/140.0.0.0 Mobile/15E148 Safari/604.1",
+          macSafari: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.1 Safari/605.1.15",
+          desktopChrome: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
+          androidChrome: "Mozilla/5.0 (Linux; Android 15; SM-S928N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36",
+          firefox: "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:143.0) Gecko/20100101 Firefox/143.0",
+        }};
+        console.log(JSON.stringify({{
+          webkit: Object.fromEntries(Object.entries(ua).map(([k, v]) => [k, isWebKit(v)])),
+          mobile: {{
+            iphone: isAppleMobile(ua.iphoneSafari, "iPhone", 5),
+            ipadDesktopMode: isAppleMobile(ua.macSafari, "MacIntel", 5),
+            mac: isAppleMobile(ua.macSafari, "MacIntel", 0),
+            android: isAppleMobile(ua.androidChrome, "Linux armv8l", 5),
+          }},
+        }}));
+        """)
+        got = json.loads(out)
+        assert got["webkit"] == {
+            "iphoneSafari": True, "iphoneChrome": True, "macSafari": True,
+            "desktopChrome": False, "androidChrome": False, "firefox": False,
+        }
+        assert got["mobile"] == {"iphone": True, "ipadDesktopMode": True, "mac": False, "android": False}
+
+    def test_webkit_gets_the_build_without_the_memory_bug(self):
+        """웹킷에서는 asyncify 판 대신 일반 판을 쓴다. 일반 판은 그래픽 가속이 없으므로 CPU 로 돈다."""
+        engine_path = WEB_DIR / "engine.js"
+        out = _run_node(f"""
+        const {{ useWebKitSafeBuild }} = await import("{engine_path.as_posix()}");
+        const base = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.26.0/dist/";
+        const make = () => ({{ backends: {{ onnx: {{ wasm: {{ wasmPaths: {{
+          mjs: base + "ort-wasm-simd-threaded.asyncify.mjs",
+          wasm: base + "ort-wasm-simd-threaded.asyncify.wasm",
+        }} }} }} }} }});
+        const iphone = make(), chrome = make();
+        useWebKitSafeBuild(iphone, "Mozilla/5.0 (iPhone; CPU iPhone OS 26_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.1 Mobile/15E148 Safari/604.1");
+        useWebKitSafeBuild(chrome, "Mozilla/5.0 (Windows NT 10.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36");
+        console.log(JSON.stringify({{ iphone: iphone.backends.onnx.wasm.wasmPaths, chrome: chrome.backends.onnx.wasm.wasmPaths }}));
+        """)
+        got = json.loads(out)
+        assert got["iphone"]["wasm"].endswith("/ort-wasm-simd-threaded.wasm")
+        assert got["iphone"]["mjs"].endswith("/ort-wasm-simd-threaded.mjs")
+        assert "asyncify" in got["chrome"]["wasm"], "웹킷이 아닌 곳은 건드리지 않아야 합니다"
+
+        engine = engine_path.read_text(encoding="utf-8")
+        load = engine[engine.index("async function loadLibrary") : engine.index("function tuneThreads")]
+        assert "useWebKitSafeBuild(" in load, "라이브러리를 불러온 직후에 판을 바꾸지 않습니다"
+        pick = engine[engine.index("async function pickDevice") : engine.index("async function loadLibrary")]
+        assert "isWebKit()" in pick, "웹킷에서 그래픽 가속을 고르면 일반 판에는 없어서 실패합니다"
+
+    def test_light_models_can_start_without_graphics_acceleration(self):
+        """q8 디코더는 onnxruntime-web 1.26 의 기본 최적화 단계에서 세션을 못 만든다.
+
+        실제 오류: "TransposeDQWeightsForMatMulNBits Missing required scale".
+        그래서 그래픽 가속이 없는 기기에서는 '보통·작음·아주 작음' 이 아예 시작하지 못했다.
+        최적화 단계를 basic 으로 낮추면 된다(실측: 보통 +1.19GB, 28초 소리를 23초에 처리).
+        q4 로 바꾸는 방법도 되지만 CPU 에서는 세 배 느리고 메모리도 더 쓴다(+2.0GB, 49초).
+        """
+        engine_path = WEB_DIR / "engine.js"
+        out = _run_node(f"""
+        const {{ MODEL_PROFILES, sessionOptionsFor }} = await import("{engine_path.as_posix()}");
+        const rows = [];
+        for (const [model, profiles] of Object.entries(MODEL_PROFILES)) {{
+          for (const [key, p] of Object.entries(profiles)) {{
+            rows.push({{ model, key, dtype: p.dtype, options: sessionOptionsFor(p.dtype) ?? null }});
+          }}
+        }}
+        rows.push({{ model: "fallback", key: "any", dtype: {{ encoder_model: "q8", decoder_model_merged: "q8" }},
+                     options: sessionOptionsFor({{ encoder_model: "q8", decoder_model_merged: "q8" }}) ?? null }});
+        console.log(JSON.stringify(rows));
+        """)
+        for row in json.loads(out):
+            uses_q8 = "q8" in row["dtype"].values()
+            if uses_q8:
+                assert row["options"] == {"graphOptimizationLevel": "basic"}, row
+            else:
+                assert row["options"] is None, f"q8 이 아닌데 최적화를 낮춥니다(느려짐): {row}"
+
+        engine = engine_path.read_text(encoding="utf-8")
+        assert "session_options" in engine, "세션 옵션을 넘기지 않습니다"
+        # 아이폰이 실제로 쓰는 '보통' 은 디코더가 CPU 에서 빠르고 가벼운 q8 이어야 한다.
+        # 인코더는 q4 여야 한다. q8 인코더는 '아주 작음' 에서 "베베베…" 만 낸다(실측).
+        for name in ("whisper-small", "whisper-base", "whisper-tiny"):
+            block = re.search(rf'"onnx-community/{name}":\s*\{{(.*?)\n  \}}', engine, re.S).group(1)
+            assert re.search(r'wasm:\s*\{\s*dtype:\s*\{\s*encoder_model:\s*"q4",\s*decoder_model_merged:\s*"q8"', block), name
+
+    def test_iphone_never_offers_the_big_model(self):
+        """'큼' 은 아이폰 메모리에 들어가지 않는다. 고르면 반드시 새로고침된다."""
+        html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+        assert "isAppleMobile(" in html
+        block = html[html.index("function adaptModelsToPhone") :]
+        block = block[: block.index("\n}\n")]
+        assert "whisper-large-v3-turbo" in block and ".remove()" in block, "아이폰에서 '큼' 을 빼지 않습니다"
+        assert "whisper-small" in block, "아이폰 기본값을 '보통' 으로 두지 않습니다"
+
+    def test_audio_is_decoded_straight_to_16khz(self):
+        """48kHz 로 한 번 펼쳤다가 줄이면 1시간 스테레오가 1.3GB 다. 바로 16kHz 로 읽는다."""
+        html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+        decode = html[html.index("async function toMono16k") : html.index("/* ---------- 실행 ---------- */")]
+        assert "(1, 1, SAMPLE_RATE)" in decode, "16kHz 컨텍스트로 바로 디코딩하지 않습니다"
+        assert "numberOfChannels" in decode
+
+    def test_audio_is_handed_to_the_worker_not_copied(self):
+        """작업자에 넘길 때 복사하면 같은 소리가 메모리에 두 벌 남는다."""
+        html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+        assert re.search(r"worker\.postMessage\(request,\s*\[", html), "소리를 복사해서 넘깁니다"
+        main = html[html.index("async function runOnMainThread") :]
+        main = main[: main.index("\n}\n")]
+        assert "toMono16k(" in main, "넘겨서 비어 버린 소리를 다시 읽지 않습니다(대비 경로가 빈 소리로 돈다)"
+
+    def test_tells_the_user_when_the_phone_killed_the_page(self):
+        """새로고침이 또 일어나도 조용히 처음 화면으로 돌아가지 않고, 이유와 대책을 알린다."""
+        html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+        assert html.count("WORK_MARK") >= 4, "작업 중 표시를 남기거나 지우지 않습니다"
+        recover = html[html.index("function recoverFromKilledPage") :]
+        recover = recover[: recover.index("\n}\n")]
+        assert "메모리" in recover
+        assert "SMALLER_MODEL" in recover, "다음에는 더 작은 모델을 고르지 않습니다"
+        for fn in ("function showError", "function showResult"):
+            body = html[html.index(fn) :]
+            assert "clearWorkMark()" in body[: body.index("\n}\n")], f"{fn} 에서 표시를 지우지 않습니다"
+        stop = html[html.index('$("stop").addEventListener') :]
+        assert "clearWorkMark()" in stop[: stop.index("\n});\n")]
+
+    def test_gpu_loss_continues_in_a_fresh_worker(self):
+        """라이브러리는 실행을 한 줄로 묶어 두어, 한 번 실패하면 같은 작업자에서는 계속 실패한다.
+
+        (transformers.js 의 webInferenceChain/webInitChain) 그래서 같은 작업자 안에서
+        일반 모드로 갈아타는 예전 방식은 한 번도 동작할 수 없었다. 새 작업자에서 이어서 한다.
+        """
+        engine = (WEB_DIR / "engine.js").read_text(encoding="utf-8")
+        worker = (WEB_DIR / "worker.js").read_text(encoding="utf-8")
+        html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+        assert "resume" in engine and "forceDevice" in engine
+        assert '"gpu-lost"' in worker and "audio.buffer" in worker, "소리를 돌려주지 않으면 이어서 할 수 없습니다"
+        handler = html[html.index('d.type === "gpu-lost"') :][:900]
+        assert "killWorker()" in handler and 'forceDevice: "wasm"' in handler
+
+    def test_switching_models_releases_the_old_one(self):
+        engine = (WEB_DIR / "engine.js").read_text(encoding="utf-8")
+        body = engine[engine.index("async function getTranscriber") :]
+        body = body[: body.index("\n}\n")]
+        assert ".dispose()" in body
+
+    def test_worker_error_reruns_the_current_request(self):
+        """작업자를 재사용하므로, 오류 처리기가 처음 요청을 붙잡고 있으면 엉뚱한 파일을 다시 돈다."""
+        html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+        start = html[html.index("function startWithWorker") :]
+        start = start[: start.index("\n}\n")]
+        assert "runOnMainThread(activeRequest)" in start
+        assert "runOnMainThread(request)" not in start
+
+    def test_service_worker_does_not_reload_on_webkit(self):
+        """사파리는 COEP credentialless 를 모른다. 새로고침해도 격리되지 않고, 파일을 읽는 중에 새로고침될 수 있다."""
+        coi = (WEB_DIR / "coi-serviceworker.js").read_text(encoding="utf-8")
+        page_part = coi[coi.index("// --- 페이지에서 불릴 때") :]
+        assert "AppleWebKit" in page_part
+        html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+        go = html[html.index('$("go").addEventListener') :]
+        assert go.index("window.__transcribing = true") < go.index("toMono16k("), (
+            "소리를 읽는 동안에는 새로고침 금지 표시가 없습니다"
+        )
+
+    def test_picking_a_file_mid_job_does_not_start_a_second_job(self):
+        """작업 중에 다른 파일을 고르면 시작 버튼이 다시 켜져 두 작업이 한 작업자에서 겹쳤다.
+
+        또 대비 경로가 '지금 고른 파일' 을 다시 읽어, 앞 작업의 이어하기에 엉뚱한 파일이 붙을 수 있었다.
+        """
+        html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+        set_file = html[html.index("function setFile") :]
+        set_file = set_file[: set_file.index("\n}\n")]
+        assert "__transcribing" in set_file, "작업 중에도 시작 버튼을 다시 켭니다"
+        main = html[html.index("async function runOnMainThread") :]
+        main = main[: main.index("\n}\n")]
+        assert "toMono16k(activeFile)" in main, "작업을 시작한 파일이 아니라 지금 고른 파일을 읽습니다"
+
+    def test_gpu_loss_on_the_main_thread_does_not_reuse_the_dead_model(self):
+        """화면에서 직접 처리하다 그래픽 가속이 끊기면, 끊긴 모델을 붙잡고 있어 다시 해도 계속 실패했다."""
+        engine = (WEB_DIR / "engine.js").read_text(encoding="utf-8")
+        lost = engine[engine.index("if (device === \"webgpu\" && isDeviceLost(error))") :][:500]
+        assert "transcriber = null" in lost and "loadedKey = null" in lost
+        assert "새로" in lost, "화면 쪽에서는 이어서 할 수 없으니 새로고침을 안내해야 합니다"

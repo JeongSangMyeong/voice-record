@@ -74,6 +74,23 @@ cd voicescribe && .venv/bin/python -m ruff check src tests
     않고 문자 그대로 남아 서버가 ENOENT 로 죽는다. 대신 `scripts/mcp_launcher.py` 를
     거치게 한다. `tests/test_mcp_launcher.py` 가 이 회귀를 막는다.
 
+### 브라우저판 (아이폰에서 '로딩하다가 새로고침' 되던 문제, 2026-10-07)
+
+11. **웹킷(아이폰의 모든 브라우저·맥 사파리)에는 onnxruntime 일반 판을 쓴다.**
+    라이브러리는 `navigator.vendor` 로 사파리를 가려내는데, vendor 는 작업자 안에 없다.
+    그래서 작업자에서는 asyncify 판을 고르고, 이 판이 iOS 26.2 이후 웹킷 JIT 메모리
+    폭주(onnxruntime#26827)를 일으켜 사파리가 탭을 끄고 다시 연다. `useWebKitSafeBuild`
+    를 지우지 말 것. 일반 판에는 그래픽 가속이 없어 웹킷은 CPU 로 돈다.
+12. **q8 디코더에는 `graphOptimizationLevel: "basic"` 이 필요하다**(onnxruntime-web 1.26).
+    없으면 "TransposeDQWeightsForMatMulNBits Missing required scale" 로 세션을 못 만든다.
+    인코더는 q4 로 둔다. q8 인코더는 tiny 에서 "베베베…" 만 낸다. CPU 에서 디코더를 q4 로
+    돌리면 세 배 느리고 메모리도 더 쓴다.
+13. **transformers.js 는 세션 생성·실행을 하나의 Promise 줄로 묶는다.** 한 번 실패하면 그
+    작업자에서는 이후 호출이 모두 같은 오류로 끝난다. 다시 하려면 새 작업자를 띄운다
+    (그래픽 가속이 끊기면 `resume` 으로 이어서 하는 이유).
+14. **아이폰 탭 메모리 한도는 약 1.5GB** — 크롬 실측 '큼' +4GB, '보통' +1.1GB. 아이폰에는
+    '큼' 을 내놓지 않는다. 사파리는 COEP `credentialless` 를 몰라 격리가 안 된다(CPU 1개).
+
 ## MCP 서버 수정
 
 - `src/voicescribe/mcp_server.py` 는 mcp 1.x(`FastMCP`)와 2.x(`MCPServer`)를 모두 지원한다.

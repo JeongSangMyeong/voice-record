@@ -19,9 +19,45 @@ let libRef = null;   // 화자 구분에서도 같은 라이브러리를 쓴다
 let transcriber = null;
 let loadedKey = null;
 
+/**
+ * 아이폰·맥 사파리(웹킷)인지 본다. 아이폰의 크롬·파이어폭스도 속은 웹킷이다.
+ *
+ * 라이브러리도 사파리를 가려내지만 navigator.vendor 로 본다. 그런데 vendor 는
+ * 창(Window)에만 있고 작업자 안에는 없어서(웹킷 NavigatorID.idl), 작업자에서는
+ * 사파리를 못 알아본다. 그래서 브라우저 이름표(userAgent)로 직접 본다.
+ */
+export function isWebKit(userAgent = globalThis.navigator?.userAgent || "") {
+  return /AppleWebKit/.test(userAgent) && !/Chrome|Chromium|Android/.test(userAgent);
+}
+
+/** 아이폰·아이패드인지 본다. 아이패드는 '데스크톱 사이트' 모드에서 맥처럼 보이므로 터치로 가린다. */
+export function isAppleMobile(userAgent, platform, maxTouchPoints) {
+  if (/iPhone|iPad|iPod/.test(userAgent)) return true;
+  return platform === "MacIntel" && maxTouchPoints > 1;
+}
+
+/**
+ * 웹킷에서는 onnxruntime 의 asyncify 판 대신 일반 판을 쓰게 한다.
+ *
+ * asyncify 판(그래픽 가속용)은 iOS 26.2 이후 웹킷이 컴파일하다 메모리를 수 GB 씩
+ * 써 버리는 버그를 일으켜, 사파리가 탭을 강제로 끄고 다시 연다
+ * (onnxruntime#26827, WebKit 304810). 아이폰에서 '로딩하다가 새로고침' 되던 원인이다.
+ * 일반 판에는 그래픽 가속이 없으므로 웹킷에서는 CPU 로 돈다(pickDevice).
+ */
+export function useWebKitSafeBuild(env, userAgent = globalThis.navigator?.userAgent || "") {
+  const wasm = env?.backends?.onnx?.wasm;
+  const paths = wasm?.wasmPaths;
+  if (!isWebKit(userAgent) || !paths || typeof paths !== "object") return;
+  wasm.wasmPaths = {
+    mjs: paths.mjs.replace(".asyncify", ""),
+    wasm: paths.wasm.replace(".asyncify", ""),
+  };
+}
+
 /** 이 기기에서 WebGPU 를 쓸 수 있는지 확인한다. 되면 훨씬 빠르다. */
 async function pickDevice() {
   try {
+    if (isWebKit()) return "wasm";   // 웹킷은 그래픽 가속이 없는 일반 판을 쓴다(useWebKitSafeBuild)
     if (!("gpu" in navigator)) return "wasm";
     const adapter = await navigator.gpu.requestAdapter();
     return adapter ? "webgpu" : "wasm";
@@ -57,6 +93,7 @@ async function loadLibrary() {
   pipelineFn = lib.pipeline;
   libRef = lib;
   lib.env.allowLocalModels = false; // 원격 모델만 쓴다
+  useWebKitSafeBuild(lib.env);
   tuneThreads(lib.env);
 }
 
@@ -119,6 +156,14 @@ function currentThreads() {
  *    그래서 GPU 에서는 q4(MatMulNBits, GPU 커널 있음)를 쓴다.
  *    파일은 조금 더 크지만 한 번만 받으면 된다.
  *
+ * 3) **그래픽 가속이 없으면(wasm) 인코더 q4 + 디코더 q8 을 쓴다.**
+ *    글자마다 도는 디코더를 CPU 에서 q4 로 돌리면 세 배 느리고 메모리도 더 쓴다.
+ *    아이폰과 같은 조건(CPU 1개, 실제 회의 28초)에서 '보통' 을 재 보니
+ *    q4+q4 는 +2.0GB·49초, q4+q8 은 +1.08GB·24초였다. 아이폰 탭 한도가 약 1.5GB 라
+ *    이 차이가 결정적이다. 인코더까지 q8 로 하면 '아주 작음' 이 "베베베…" 같은
+ *    엉뚱한 글자만 낸다(실측). q8 은 세션 옵션이 함께 필요하다(sessionOptionsFor 참고).
+ *    '큼' 은 q8 파일이 더 커서(1035MB) q4 를 그대로 쓴다. 아이폰에는 아예 내놓지 않는다.
+ *
  * sizeMB 는 실제 파일 크기의 합이다(Hugging Face 확인).
  * 화면에 안내하는 용량과 테스트가 이 값을 함께 본다.
  *
@@ -151,6 +196,18 @@ export const MODEL_PROFILES = {
 /** 어떤 기기에서도 존재가 보장되는 조합(마지막 대비책). */
 const FALLBACK_DTYPE = { encoder_model: "q8", decoder_model_merged: "q8" };
 
+/**
+ * q8 파일을 쓸 때 필요한 세션 옵션.
+ *
+ * 지금 라이브러리(onnxruntime-web 1.26)는 기본 그래프 최적화 단계에서 q8 디코더의
+ * 세션을 만들지 못한다("TransposeDQWeightsForMatMulNBits Missing required scale").
+ * 이 때문에 그래픽 가속이 없는 기기에서 '보통·작음·아주 작음' 이 아예 시작하지 못했다.
+ * 최적화 단계를 basic 으로 낮추면 된다(실측). q8 이 아니면 낮출 이유가 없다(느려진다).
+ */
+export function sessionOptionsFor(dtype) {
+  return Object.values(dtype).includes("q8") ? { graphOptimizationLevel: "basic" } : undefined;
+}
+
 /** WebGPU 가 있어도 fp16 을 못 쓰는 기기가 있다. 실제로 확인한다. */
 async function supportsFp16() {
   try {
@@ -179,8 +236,11 @@ async function getTranscriber(model, onEvent, forceDevice = null) {
   const key = `${model}|${device}`;
   if (transcriber && loadedKey === key) return { asr: transcriber, device };
 
+  // 다른 모델로 바꿀 때는 먼저 쓰던 것을 풀어 준다. 그냥 두면 두 모델이 메모리에 함께 남는다.
+  const previous = transcriber;
   transcriber = null;
   loadedKey = null;
+  try { await previous?.dispose(); } catch { /* 이미 망가진 세션이면 풀 것도 없다 */ }
 
   const dtype = await pickDtype(model, device);
 
@@ -192,17 +252,19 @@ async function getTranscriber(model, onEvent, forceDevice = null) {
     }
   };
 
-  try {
-    transcriber = await pipelineFn("automatic-speech-recognition", model, {
-      device, dtype, progress_callback,
+  const load = (chosen) => {
+    const session_options = sessionOptionsFor(chosen);
+    return pipelineFn("automatic-speech-recognition", model, {
+      device, dtype: chosen, progress_callback, ...(session_options && { session_options }),
     });
+  };
+  try {
+    transcriber = await load(dtype);
   } catch (error) {
     // 지정한 파일이 그 모델에 없을 수 있다. 확실한 조합으로 한 번 더 시도한다.
     if (!/could not locate|not found|404/i.test(String(error?.message || error))) throw error;
     onEvent({ type: "phase", phase: "retrying" });
-    transcriber = await pipelineFn("automatic-speech-recognition", model, {
-      device, dtype: FALLBACK_DTYPE, progress_callback,
-    });
+    transcriber = await load(FALLBACK_DTYPE);
   }
   loadedKey = key;
   return { asr: transcriber, device };
@@ -214,6 +276,10 @@ async function getTranscriber(model, onEvent, forceDevice = null) {
  * 휴대폰을 다른 앱에 오래 두면 안드로이드가 그래픽 메모리를 회수해 간다.
  * 그러면 돌던 작업이 여기서 터진다. 처음부터 다시 시키지 말고
  * 일반 모드로 갈아타서 이어서 하는 편이 낫다.
+ *
+ * 단, 같은 작업자 안에서는 갈아탈 수 없다. 라이브러리가 실행을 한 줄로 묶어 두어
+ * (transformers.js 의 webInferenceChain), 한 번 실패하면 이후 실행도 같은 오류로 끝난다.
+ * 그래서 어디까지 했는지(resume)를 들려 보내고, 화면 쪽이 새 작업자를 띄워 이어서 하게 한다.
  */
 function isDeviceLost(error) {
   const text = String(error?.message || error || "").toLowerCase();
@@ -405,10 +471,10 @@ export function tileAtPauses(audio, sampleRate, maxSeconds = WINDOW_SECONDS) {
 
 /** 오디오를 받아쓴다(내부 구현). */
 async function runWhisper(request, onEvent) {
-  const { audio, model, language, sampleRate } = request;
+  const { audio, model, language, sampleRate, resume } = request;
 
   onEvent({ type: "phase", phase: "loading" });
-  const { asr, device } = await getTranscriber(model, onEvent);
+  const { asr, device } = await getTranscriber(model, onEvent, request.forceDevice || null);
   onEvent({ type: "device", device, threads: currentThreads() });
 
   onEvent({ type: "phase", phase: "transcribing" });
@@ -426,11 +492,10 @@ async function runWhisper(request, onEvent) {
     totalSeconds: audio.length / sampleRate,
   });
 
-  const collected = [];
-  let text = "";
-  let engine = asr;
-  let usingDevice = device;
-  let switchedToCpu = false;
+  // 그래픽 가속이 끊겨 새 작업자에서 이어서 하는 중이면, 앞서 한 데까지는 그대로 쓴다.
+  const startIndex = resume?.from || 0;
+  const collected = resume ? [...resume.chunks] : [];
+  let text = resume?.text || "";
 
   const options = {
     language: language === "auto" ? null : language,
@@ -439,26 +504,24 @@ async function runWhisper(request, onEvent) {
     chunk_length_s: 0,   // 창이 이미 30초 이하라 추가로 자를 필요가 없다
   };
 
-  for (let i = 0; i < windows.length; i++) {
+  for (let i = startIndex; i < windows.length; i++) {
     const w = windows[i];
     let piece;
     try {
-      piece = await engine(audio.subarray(w.from, w.to), options);
+      piece = await asr(audio.subarray(w.from, w.to), options);
     } catch (error) {
-      // 다른 앱을 오래 쓰면 안드로이드가 그래픽 메모리를 회수해 간다.
-      // 그때 처음부터 다시 시키지 말고 일반 모드로 갈아타서 이어서 한다.
-      if (!switchedToCpu && usingDevice === "webgpu" && isDeviceLost(error)) {
-        switchedToCpu = true;
-        onEvent({ type: "phase", phase: "gpu-lost" });
+      // 다른 앱을 오래 쓰면 안드로이드가 그래픽 메모리를 회수해 간다(isDeviceLost 참고).
+      if (device === "webgpu" && isDeviceLost(error)) {
+        // 끊긴 모델을 붙잡고 있으면 다음 시도도 같은 모델을 다시 꺼내 쓴다.
         transcriber = null;
         loadedKey = null;
-        const again = await getTranscriber(model, onEvent, "wasm");
-        engine = again.asr;
-        usingDevice = again.device;
-        piece = await engine(audio.subarray(w.from, w.to), options);
-      } else {
-        throw error;
+        // 작업자에서는 화면 쪽이 새 작업자로 이어서 하므로 이 문구가 보이지 않는다.
+        // 화면에서 직접 처리하던 중이면 페이지 전체가 같은 줄에 묶여 있어 새로고침밖에 없다.
+        const lost = new Error("그래픽 가속이 끊겼습니다. 페이지를 새로 고친 뒤 다시 시도해 주세요.");
+        lost.resume = { from: i, text, chunks: collected };
+        throw lost;
       }
+      throw error;
     }
     text += (text ? " " : "") + (piece.text || "").trim();
     for (const c of piece.chunks || []) {
@@ -475,14 +538,15 @@ async function runWhisper(request, onEvent) {
       done,
       total: windows.length,
       elapsed: spent,
-      remaining: done > 0 ? (spent / done) * (windows.length - done) : null,
+      // 이어서 하는 중이면 이번에 처리한 구간만으로 속도를 잰다.
+      remaining: (spent / (done - startIndex)) * (windows.length - done),
     });
   }
   return {
     text,
     chunks: collected,
     elapsed: ((globalThis.performance || Date).now() - started) / 1000,
-    device: usingDevice,
+    device,
   };
 }
 

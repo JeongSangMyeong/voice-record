@@ -10,10 +10,20 @@
 import { runTranscription } from "./engine.js";
 
 self.addEventListener("message", async (event) => {
+  const request = event.data;
   try {
-    const result = await runTranscription(event.data, (e) => self.postMessage(e));
+    const result = await runTranscription(request, (e) => self.postMessage(e));
     self.postMessage(result);
   } catch (error) {
+    if (error?.resume) {
+      // 그래픽 가속이 끊겼다. 이 작업자에서는 더 돌릴 수 없으니 어디까지 했는지와
+      // 소리를 돌려준다. 소리는 넘겨받은 것이라 화면 쪽에는 남아 있지 않다.
+      self.postMessage(
+        { type: "gpu-lost", resume: error.resume, audio: request.audio },
+        [request.audio.buffer],
+      );
+      return;
+    }
     self.postMessage({ type: "error", message: String(error?.message || error) });
   }
 });

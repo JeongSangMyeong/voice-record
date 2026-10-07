@@ -63,10 +63,18 @@ if (typeof window === "undefined") {
     if (window.crossOriginIsolated) return;              // 이미 준비됨
     if (!window.isSecureContext || !navigator.serviceWorker) return;
 
+    // 사파리(웹킷, 아이폰의 모든 브라우저 포함)는 COEP credentialless 를 모른다.
+    // 새로고침해도 격리되지 않으니 새로고침하지 않는다. 쓸데없을 뿐 아니라
+    // 파일을 고른 직후에 일어나면 고른 파일이 사라진다. 서비스 워커는 알림에 쓰므로 등록은 한다.
+    // (판별 기준은 engine.js 의 isWebKit 과 같다. 이 파일은 모듈이 아니라 가져다 쓸 수 없다)
+    const ua = navigator.userAgent;
+    const webkit = /AppleWebKit/.test(ua) && !/Chrome|Chromium|Android/.test(ua);
+
     // 헤더는 "문서를 받아 올 때" 붙어야 효력이 있다.
     // 서비스 워커는 등록 직후부터 잡으므로, 지금 열려 있는 이 문서에는
     // 아직 헤더가 없다. 그래서 딱 한 번만 새로고침해서 다시 받아 온다.
     const reloadOnce = () => {
+      if (webkit) return;
       if (sessionStorage.getItem("coi-reloaded")) return;  // 무한 새로고침 방지
       if (window.__transcribing) return;                   // 작업 중이면 절대 건드리지 않는다
       sessionStorage.setItem("coi-reloaded", "1");
