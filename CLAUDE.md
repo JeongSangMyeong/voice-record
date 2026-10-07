@@ -15,6 +15,12 @@
 `fetch` 는 모델을 받을 때만 쓰고, 보내는 내용(body)이 있어서는 안 된다.
 `test_never_uploads_audio` 가 이를 검사한다.
 
+## 녹음을 받아쓸 때 (Claude Code 대화에서)
+
+스킬로 하든 MCP `transcribe_audio` 도구로 하든, 받아쓴 뒤에는 **묻지 않고 Opus 5.5 로 자동 교정한다**
+(사용자 결정 2026-10-07). 방법·규칙은 `.claude/skills/voice-transcribe/SKILL.md` 4번. 원본은 남기고
+교정본을 따로 저장한다. 웹사이트(브라우저판)에는 교정 기능을 넣지 않는다 — 써 보고 뺐다.
+
 ## VoiceScribe(PC판) 빠른 시작
 
 ```bash
