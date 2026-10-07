@@ -219,3 +219,32 @@ class TestCallRecordingHint:
 
     def test_other_recordings_are_left_to_guess(self, two_speaker_wav, monkeypatch):
         assert self._captured(monkeypatch, two_speaker_wav) == {"min_speakers": None, "max_speakers": None}
+
+
+class TestRunawayRepeats:
+    """잡음에 빠진 Whisper 가 같은 낱말을 끝없이 되풀이한다(실제 회의 녹음: '아' 116번).
+
+    call-agent(squash_repeats)와 같은 기준: 6번 이상 연달아 나오면 2번만 남긴다.
+    """
+
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            ("아 " * 116 + "근데 그건", "아 아 근데 그건"),
+            ("네 네 네 알겠습니다", "네 네 네 알겠습니다"),       # 5번 이하는 실제 말일 수 있다
+            ("", ""),
+            ("하나 둘 셋", "하나 둘 셋"),
+        ],
+    )
+    def test_squash(self, text, expected):
+        from voicescribe.transcriber import squash_repeats
+
+        assert squash_repeats(text) == expected
+
+    def test_pipeline_cleans_every_segment(self):
+        import inspect
+
+        from voicescribe import transcriber
+
+        body = inspect.getsource(transcriber.transcribe_buffer)
+        assert "squash_repeats(" in body

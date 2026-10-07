@@ -1123,3 +1123,15 @@ class TestCallRecordingsInTheBrowser:
         assert "speakerLimitFromFileName" in set_file, "통화 녹음 파일을 골라도 2명으로 맞춰 주지 않습니다"
         engine = (WEB_DIR / "engine.js").read_text(encoding="utf-8")
         assert "request.maxSpeakers || speakerLimitFromFileName(request.fileName)" in engine
+
+
+class TestRunawayRepeatsInTheBrowser:
+    def test_squash(self):
+        out = _run_node(f"""
+        const {{ squashRepeats }} = await import("{(WEB_DIR / 'engine.js').as_posix()}");
+        console.log(JSON.stringify([squashRepeats("아 ".repeat(116) + "근데 그건"), squashRepeats("네 네 네 알겠습니다"), squashRepeats("")]));
+        """)
+        assert json.loads(out) == ["아 아 근데 그건", "네 네 네 알겠습니다", ""]
+        engine = (WEB_DIR / "engine.js").read_text(encoding="utf-8")
+        loop = engine[engine.index("for (let i = startIndex; i < windows.length; i++)") :][:2500]
+        assert "squashRepeats(" in loop, "받아쓴 구간마다 정리하지 않습니다"

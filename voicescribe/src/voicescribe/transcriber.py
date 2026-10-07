@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from .audio import AudioBuffer, load_audio
@@ -45,6 +45,26 @@ class TranscribeRequest:
     extra: dict[str, object] = field(default_factory=dict)
 
 
+def squash_repeats(text: str, keep: int = 2, runaway: int = 6) -> str:
+    """같은 낱말이 runaway 번 이상 연달아 나오면 keep 번만 남긴다.
+
+    잡음에 빠진 Whisper 가 같은 말을 끝없이 되풀이한다(실제 회의 녹음에서 '아' 116번).
+    5번 이하는 실제로 그렇게 말했을 수 있어 그대로 둔다. call-agent 와 같은 기준이다.
+    """
+    words = text.split()
+    if len(words) < runaway:
+        return text
+    out: list[str] = []
+    i = 0
+    while i < len(words):
+        j = i
+        while j < len(words) and words[j] == words[i]:
+            j += 1
+        out.extend(words[i:j] if j - i < runaway else words[i : i + keep])
+        i = j
+    return " ".join(out)
+
+
 def transcribe_buffer(
     audio: AudioBuffer,
     request: TranscribeRequest,
@@ -69,6 +89,7 @@ def transcribe_buffer(
         extra=dict(request.extra),
     )
     result = engine.transcribe(audio, options, progress)
+    result.segments = [replace(s, text=squash_repeats(s.text)) for s in result.segments]
 
     if request.diarize:
         from .diarize import apply_diarization, speakers_hint_from_name

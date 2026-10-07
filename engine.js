@@ -469,6 +469,25 @@ export function tileAtPauses(audio, sampleRate, maxSeconds = WINDOW_SECONDS) {
   });
 }
 
+/**
+ * 같은 낱말이 6번 이상 연달아 나오면 2번만 남긴다.
+ *
+ * 잡음에 빠진 Whisper 가 같은 말을 끝없이 되풀이한다(실제 회의 녹음에서 '아' 116번).
+ * 5번 이하는 실제로 그렇게 말했을 수 있어 그대로 둔다. PC판·call-agent 와 같은 기준이다.
+ */
+export function squashRepeats(text, keep = 2, runaway = 6) {
+  const words = text.split(/\s+/).filter(Boolean);
+  if (words.length < runaway) return text;
+  const out = [];
+  for (let i = 0; i < words.length;) {
+    let j = i;
+    while (j < words.length && words[j] === words[i]) j++;
+    out.push(...words.slice(i, j - i < runaway ? j : i + keep));
+    i = j;
+  }
+  return out.join(" ");
+}
+
 /** 오디오를 받아쓴다(내부 구현). */
 async function runWhisper(request, onEvent) {
   const { audio, model, language, sampleRate, resume } = request;
@@ -523,12 +542,12 @@ async function runWhisper(request, onEvent) {
       }
       throw error;
     }
-    text += (text ? " " : "") + (piece.text || "").trim();
+    text += (text ? " " : "") + squashRepeats((piece.text || "").trim());
     for (const c of piece.chunks || []) {
       collected.push({
         start: (c.timestamp?.[0] ?? 0) + w.start,   // 원본 기준 시각으로 되돌린다
         end: (c.timestamp?.[1] ?? 0) + w.start,
-        text: (c.text || "").trim(),
+        text: squashRepeats((c.text || "").trim()),
       });
     }
     const done = i + 1;
