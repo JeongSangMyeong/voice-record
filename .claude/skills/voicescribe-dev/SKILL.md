@@ -64,7 +64,9 @@ cd voicescribe && .venv/bin/python -m ruff check src tests
    반드시 **원본 오디오**에서 앞뒤 0.8초 여유를 두고 다시 잘라야 한다.
 4. **sherpa VAD 프레임은 512 샘플 고정**(16kHz 기준). 다른 값을 넣으면 조용히 오작동한다.
    또 이 API 의 시간 단위는 **초**다(pip `silero-vad` 패키지는 밀리초라 헷갈리기 쉽다).
-5. **화자 분리 임계값 0.8** — sherpa 기본값 0.5 는 같은 사람을 여러 명으로 쪼갠다.
+5. **화자 분리는 ERes2Net + 임계값 1.1** — 임계값은 임베딩 모델마다 다르다. CAM++ 는 0.8 이 맞았지만
+   ERes2Net 에 0.8 을 쓰면 2인 대화가 3~5명이 된다. 모델을 바꾸면 임계값도 실제 대화로 다시 재야 한다
+   (2026-10-07: 사람 수를 2로 정한 한국어 2인 대화에서 ERes2Net 81.5%, CAM++ 75.3%, WeSpeaker 61.7%).
 6. **모델 URL 의 `speaker-recongition-models` 오타는 업스트림 그대로**다. 고치면 404.
 7. **argostranslate 는 가볍게 설치할 수 없다** — `argostranslate.translate` 가 최상위에서
    `stanza` 를 import 하고, stanza 가 PyTorch·CUDA 를 끌어온다. `--no-deps` 우회는 실패한다.

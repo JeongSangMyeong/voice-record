@@ -44,11 +44,11 @@ _SEGMENTATION_URL = (
 #: 주의: 아래 URL 의 'recongition' 오타는 업스트림 릴리스 태그 그대로다. 고치면 404 가 난다.
 _EMBEDDING_URL = (
     "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/"
-    "3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx"
+    "3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx"
 )
-#: 군집 임계값. 기본값 0.5 는 같은 사람을 여러 명으로 쪼개는 경향이 강하다
-#: (4명짜리 파일에서 10명이 나옴). 0.8 이 훨씬 안정적이다.
-_CLUSTER_THRESHOLD = 0.8
+#: 군집 임계값. ERes2Net 은 CAM++ 보다 거리가 크게 나와 CAM++ 때의 0.8 로는 2인 대화가 3~5명이 된다.
+#: 1.1 에서 2인 대화 2~3명, 3~4인 회의 3~5명으로 가장 실제에 가까웠다(2026-10-07 측정).
+_CLUSTER_THRESHOLD = 1.1
 
 
 # --------------------------------------------------------------------------- #
@@ -293,7 +293,7 @@ def _ensure_sherpa_models() -> tuple[str, str]:
     root = _model_cache_dir()
     root.mkdir(parents=True, exist_ok=True)
     segmentation = root / "sherpa-onnx-pyannote-segmentation-3-0" / "model.onnx"
-    embedding = root / "3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx"
+    embedding = root / _EMBEDDING_URL.rsplit("/", 1)[-1]
 
     if not segmentation.exists():
         archive = root / "sherpa-onnx-pyannote-segmentation-3-0.tar.bz2"

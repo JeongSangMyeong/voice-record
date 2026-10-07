@@ -152,6 +152,45 @@ class TestDiarization:
         assert all(s.speaker for s in result.segments)
 
 
+class TestSpeakerModel:
+    """PC 화자 구분은 ERes2Net 을 쓴다(2026-10-07 비교).
+
+    실제 한국어 2인 대화(MagicHub 3편, 사람 수를 2로 정함)에서 맞힌 비율이
+    CAM++ 75.3%/70.7%(원음/전화음질), ERes2Net 81.5%/78.9% 였다. call-agent 도 같은 이유로 ERes2Net 을 쓴다.
+    """
+
+    def test_uses_eres2net(self):
+        from voicescribe import diarize
+
+        assert "eres2net" in diarize._EMBEDDING_URL
+        assert "campplus" not in diarize._EMBEDDING_URL
+
+    def test_threshold_fits_eres2net(self):
+        """ERes2Net 은 CAM++ 보다 거리가 크게 나온다. CAM++ 의 0.8 을 그대로 쓰면 2인 대화가 3~5명이 된다.
+
+        1.1 에서 2인 대화는 2~3명, 3~4인 회의(AMI)는 3~5명으로 가장 실제에 가까웠다.
+        """
+        from voicescribe import diarize
+
+        assert diarize._CLUSTER_THRESHOLD == 1.1
+
+    def test_cached_model_file_matches_the_download(self, tmp_path, monkeypatch):
+        """받은 파일 이름과 찾는 파일 이름이 어긋나면 매번 다시 받는다."""
+        from voicescribe import diarize
+
+        monkeypatch.setenv("VOICESCRIBE_MODEL_DIR", str(tmp_path))
+        (tmp_path / "sherpa-onnx-pyannote-segmentation-3-0").mkdir()
+        (tmp_path / "sherpa-onnx-pyannote-segmentation-3-0" / "model.onnx").write_bytes(b"x")
+        (tmp_path / diarize._EMBEDDING_URL.rsplit("/", 1)[-1]).write_bytes(b"x")
+
+        def no_download(*_args, **_kwargs):
+            raise AssertionError("이미 받은 모델을 다시 받으면 안 된다")
+
+        monkeypatch.setattr("urllib.request.urlretrieve", no_download)
+        _, embedding = diarize._ensure_sherpa_models()
+        assert embedding.endswith(diarize._EMBEDDING_URL.rsplit("/", 1)[-1])
+
+
 class TestSaveOutputs:
     def test_transcribe_and_save(self, two_speaker_wav, tmp_path):
         from voicescribe.transcriber import transcribe_and_save
