@@ -99,6 +99,9 @@ cd voicescribe && .venv/bin/python -m ruff check src tests
     - 최상위 `/models/` 는 `.gitignore` 에 걸려 있어 그 아래에 두면 커밋되지 않는다.
     - 모델 파일은 Git LFS 로 바꾸면 안 된다(GitHub Pages 가 LFS 를 내주지 않는다). 100MB 를 넘기지 않는다.
     - 기준값은 모델마다 다르다. ERes2Net 을 WeSpeaker 기준(0.35)으로 쓰면 안 된다.
+    - 인원 '자동' 이면 말한 시간 10% 미만 무리를 가장 닮은 사람에게 합친다(`mergeQuietSpeakers`).
+      영어는 목소리 모델이 원래 약해서(정답 구간으로도 2인 73%) 기준값만으로는 못 고쳤다.
+      인원을 정했으면 합치지 않는다. 측정 스크립트: `~/.cache/voicescribe-bench/web-spk*/`
 
 ## MCP 서버 수정
 

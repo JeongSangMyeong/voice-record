@@ -1275,3 +1275,53 @@ class TestKoreanSpeakerModel:
         assert b"input_features" in onnx.read_bytes()[-200_000:] or b"input_features" in onnx.read_bytes()[:200_000]
         notice = (KOREAN_MODEL_DIR / "README.md").read_text(encoding="utf-8")
         assert "Apache" in notice and "eres2net" in notice.lower(), "출처와 라이선스를 밝혀야 합니다"
+
+
+class TestQuietSpeakersAreMerged:
+    """인원 '자동' 에서 말을 아주 적게 한 무리는 가장 닮은 사람에게 합친다(2026-10-09).
+
+    짧은 말 한두 마디가 따로 무리가 되어 2인 대화가 8명으로 나오곤 했다. 영어 회의 녹음(AMI) 24개에서
+    WeSpeaker 0.35 그대로는 인원 정확 0/24(평균 4.8명 어긋남). 전체 말한 시간의 10% 미만 무리를 합치니
+    9/24(0.8명), 한국어(ERes2Net) 19개는 10/19 → 12/19. 기준값을 바꾸는 것만으로는 영어가 나아지지 않았다
+    (목소리 모델이 이 녹음을 잘 못 가르기 때문). 인원을 정했으면 그 사람 수를 믿고 합치지 않는다.
+    """
+
+    def test_merge_quiet_speakers(self):
+        out = _run_node(f"""
+        const {{ mergeQuietSpeakers }} = await import("{(WEB_DIR / 'diarize.js').as_posix()}");
+        const unit = (...xs) => {{ const v = Float32Array.from(xs); const n = Math.hypot(...v); return v.map((x) => x / n); }};
+        const a = unit(1, 0, 0), b = unit(0, 1, 0), nearB = unit(0.2, 1, 0.3);
+        const vectors = [a, a, a, a, a, b, b, b, b, b, nearB];
+        const labels = [0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 2];
+        const seconds = [10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 2];   // 세 번째 '사람' 은 2초(2%)뿐
+        console.log(JSON.stringify([
+          mergeQuietSpeakers(vectors, labels, seconds, 0.1),
+          mergeQuietSpeakers(vectors, labels, seconds, 0),
+          mergeQuietSpeakers([a, b], [0, 1], [9, 0.5], 0.1),
+          mergeQuietSpeakers([a, a], [0, 0], [5, 5], 0.1),
+        ]));
+        """)
+        merged, untouched, two_people, one_person = json.loads(out)
+        assert merged == [0] * 5 + [1] * 6, "말을 적게 한 무리가 가장 닮은 사람에게 가야 합니다"
+        assert untouched == [0] * 5 + [1] * 5 + [2]
+        assert two_people == [0, 0], "10% 미만이면 두 명이라도 합칩니다"
+        assert one_person == [0, 0]
+
+    def test_only_when_the_headcount_is_automatic(self):
+        lib = _fake_speaker_lib(fail_local=False).replace(
+            "const audio = new Float32Array([...second(1), ...second(-1), ...second(1), ...second(-1)]);",
+            "const audio = new Float32Array([...Array.from({ length: 19 }, () => [...second(1)]).flat(), ...second(-1)]);",
+        ).replace(
+            "const segments = (text) => [0, 1, 2, 3].map((t) => ({ start: t, end: t + 1, text }));",
+            "const segments = (text) => [{ start: 0, end: 19, text }, { start: 19, end: 20, text }];",
+        )
+        assert "end: 19" in lib and "length: 19" in lib, "가짜 녹음을 바꾸지 못했습니다"
+        out = _run_node(lib + f"""
+        const {{ assignSpeakers }} = await import("{(WEB_DIR / 'diarize.js').as_posix()}");
+        const auto = await assignSpeakers(audio, segments("hello"), 16000, {{ transformers: lib, language: "en" }});
+        const two = await assignSpeakers(audio, segments("hello"), 16000, {{ transformers: lib, language: "en", maxSpeakers: 2 }});
+        console.log(JSON.stringify([auto, two]));
+        """)
+        auto, two = json.loads(out)
+        assert auto == ["화자1", "화자1"], "1초(5%)만 말한 무리가 따로 남았습니다"
+        assert two == ["화자1", "화자2"], "2명으로 정했는데 합쳐 버렸습니다"

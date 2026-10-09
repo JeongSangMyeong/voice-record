@@ -61,6 +61,17 @@ export const SPEAKER_MODELS = {
 /** 이보다 많은 사람으로는 나누지 않는다. */
 const MAX_SPEAKERS = 8;
 
+/**
+ * 인원 '자동' 일 때, 전체 말한 시간에서 이 비율보다 적게 말한 무리는 가장 닮은 사람에게 합친다.
+ *
+ * 짧은 말 한두 마디가 따로 무리가 되어 2인 대화가 8명으로 나오곤 했다(2026-10-09 측정,
+ * 웹과 같은 Whisper small 구간). 기준값만 바꿔서는 영어가 나아지지 않았다.
+ *   영어 회의(AMI) 24개, WeSpeaker  인원 정확 0/24(평균 4.8명 어긋남) → 9/24(0.8명)
+ *   한국어 19개, ERes2Net           10/19(0.6명) → 12/19(0.4명)
+ * 기존 평가셋의 '한 명이 대부분, 다른 한 명이 가끔'(15%) 은 그대로 두 명으로 남는다.
+ */
+const MIN_TALK_SHARE = 0.1;
+
 /** 이보다 긴 구간만 무리를 만드는 데 쓴다. 짧으면 지문이 흔들려 무리를 흐린다. */
 const MIN_SECONDS = 0.5;
 
@@ -275,6 +286,31 @@ export function nearestCentroid(vector, centroids) {
 }
 
 /**
+ * 말을 아주 적게 한 무리를 가장 닮은 무리에 합친다. 가장 적게 말한 무리부터 하나씩.
+ *
+ * @param {Float32Array[]} vectors 구간별 목소리 지문
+ * @param {number[]} labels 구간별 무리 번호
+ * @param {number[]} seconds 구간별 길이(초)
+ * @param {number} share 전체 말한 시간에서 이 비율 미만이면 합친다
+ * @returns {number[]} 새 무리 번호
+ */
+export function mergeQuietSpeakers(vectors, labels, seconds, share = MIN_TALK_SHARE) {
+  const total = seconds.reduce((sum, s) => sum + s, 0);
+  let current = [...labels];
+  for (;;) {
+    const talk = new Map();
+    current.forEach((label, i) => talk.set(label, (talk.get(label) || 0) + seconds[i]));
+    if (talk.size < 2) return current;
+    const [quiet, said] = [...talk.entries()].reduce((least, entry) => (entry[1] < least[1] ? entry : least));
+    if (said >= share * total) return current;
+    const centroids = centroidsOf(vectors, current);
+    const own = centroids.find((c) => c.label === quiet).center;
+    const target = nearestCentroid(own, centroids.filter((c) => c.label !== quiet));
+    current = current.map((label) => (label === quiet ? target : label));
+  }
+}
+
+/**
  * 무리 번호를 사람이 읽는 이름으로 바꾸고, 건너뛴 구간을 메운다.
  *
  * @param {number} total 전체 구간 수
@@ -356,7 +392,7 @@ export async function assignSpeakers(audio, segments, sampleRate, options = {}) 
 
     const inputs = await processor(audio.subarray(start, end));
     const vector = pickEmbedding(await model(inputs));
-    (seconds >= MIN_SECONDS ? strong : weak).push({ index, vector });
+    (seconds >= MIN_SECONDS ? strong : weak).push({ index, vector, seconds });
 
     options.onSegment?.(++done, segments.length);
   }
@@ -364,8 +400,11 @@ export async function assignSpeakers(audio, segments, sampleRate, options = {}) 
   if (strong.length < 2) return segments.map(() => "화자1");
 
   const threshold = options.maxSpeakers ? speaker.sameSpeakerWithLimit : speaker.sameSpeaker;
-  const labels = clusterByAffinity(strong.map((s) => s.vector), threshold, options.maxSpeakers || MAX_SPEAKERS);
-  const centroids = centroidsOf(strong.map((s) => s.vector), labels);
+  const vectors = strong.map((s) => s.vector);
+  const grouped = clusterByAffinity(vectors, threshold, options.maxSpeakers || MAX_SPEAKERS);
+  // 인원을 정했으면 그 수를 믿는다. 자동일 때만 말을 아주 적게 한 무리를 합친다.
+  const labels = options.maxSpeakers ? grouped : mergeQuietSpeakers(vectors, grouped, strong.map((s) => s.seconds));
+  const centroids = centroidsOf(vectors, labels);
 
   const judged = strong
     .map((s, i) => ({ index: s.index, label: labels[i] }))
