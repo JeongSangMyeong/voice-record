@@ -25,6 +25,39 @@ export const SPEAKER_MODEL = "onnx-community/wespeaker-voxceleb-resnet34-LM";
  */
 const SAME_SPEAKER = 0.35;
 
+/**
+ * 한국어 녹음에 쓰는 목소리 모델(ERes2Net, 약 40MB). 이 사이트에 같이 올려 둔 파일이다.
+ *
+ * 웹과 같은 방식으로 재 보니(2026-10-07) 한국어 2인 대화(원음)는 WeSpeaker 74% → ERes2Net 82% 로
+ * 나았지만 영어 3~4인 회의는 76% → 66~69% 로 나빴다. 중국어로 배운 모델이라 그렇다.
+ * 그래서 한국어일 때만 쓴다. GitHub 릴리스 파일은 브라우저가 직접 받지 못해(CORS) 저장소에 넣었다.
+ * 출처·라이선스·바꾼 점은 speaker-model/eres2net-base/README.md 에 있다.
+ */
+const KOREAN_SPEAKER_MODEL = new URL("./speaker-model/eres2net-base", import.meta.url).pathname;
+
+/**
+ * ERes2Net 의 같은 사람 기준. 모델마다 유사도 크기가 달라 따로 쟀고, 인원을 아는지에 따라서도 다르다.
+ *
+ * 한국어 평가셋 19개(실제 2인 대화 12·3~4인 회의 4·혼자 3, 웹과 같은 Whisper small 구간, 2026-10-09)
+ *   자동     0.20~0.24 → 인원 정확 10~11/19, 0.26 부터 쪼개짐(6/19) → 가운데 0.22
+ *   인원 지정 0.35      → 18/19, 2인 대화 12/12 (낮추면 전화 음질 통화를 한 명으로 합친다)
+ * 인원을 정하면 그 수까지는 무조건 합치므로, 기준값은 '그보다 더 적은가' 만 가린다. 그래서 높게 둔다.
+ * 같은 자리에서 WeSpeaker 0.35 자동은 3/19 였다(2인 통화를 4~8명으로 쪼갰다).
+ */
+const SAME_SPEAKER_KOREAN = 0.22;
+const SAME_SPEAKER_KOREAN_WITH_LIMIT = 0.35;
+
+/** 언어별 목소리 모델. 두 모델 모두 같은 특징(80차 fbank)을 받는다. */
+export const SPEAKER_MODELS = {
+  default: { id: SPEAKER_MODEL, sameSpeaker: SAME_SPEAKER, sameSpeakerWithLimit: SAME_SPEAKER, fromThisSite: false },
+  korean: {
+    id: KOREAN_SPEAKER_MODEL,
+    sameSpeaker: SAME_SPEAKER_KOREAN,
+    sameSpeakerWithLimit: SAME_SPEAKER_KOREAN_WITH_LIMIT,
+    fromThisSite: true,
+  },
+};
+
 /** 이보다 많은 사람으로는 나누지 않는다. */
 const MAX_SPEAKERS = 8;
 
@@ -37,7 +70,8 @@ const MIN_EMBED_SECONDS = 0.3;
 /** 한 구간에서 목소리 판단에 쓰는 최대 길이. 더 들어도 나아지지 않고 느려지기만 한다. */
 const MAX_EMBED_SECONDS = 10;
 
-let cached = null;
+/** 준비해 둔 목소리 모델. 언어마다 하나씩. 받지 못한 것은 담지 않아 다음에 다시 시도한다. */
+const cached = new Map();
 
 /**
  * 파일 이름으로 인원 상한을 짐작한다. '통화녹음_이름' 같은 통화 녹음이면 2, 모르면 null.
@@ -53,23 +87,62 @@ export function speakerLimitFromFileName(name) {
 }
 
 /**
+ * 어느 목소리 모델을 쓸지 고른다. 한국어면 "korean", 아니면 "default".
+ *
+ * 언어를 직접 골랐으면 그대로 따르고, '자동'이면 받아쓴 글에 한글이 영문자보다 많은지로 본다.
+ *
+ * @param {string|null} language 사용자가 고른 언어("ko", "en", "auto" …)
+ * @param {{text?: string}[]} segments 받아쓴 구간
+ */
+export function speakerModelFor(language, segments = []) {
+  if (language && language !== "auto") return language === "ko" ? "korean" : "default";
+  const text = segments.map((s) => s.text || "").join(" ");
+  const hangul = (text.match(/[\uAC00-\uD7A3]/g) || []).length;
+  const latin = (text.match(/[A-Za-z]/g) || []).length;
+  return hangul > 0 && hangul >= latin ? "korean" : "default";
+}
+
+/**
  * 목소리 모델을 준비한다.
  *
  * @param {object} lib 이미 불러 둔 @huggingface/transformers 모듈
+ * @param {"default"|"korean"} which 어느 모델인지
  * @param {object} options device 와 진행률 콜백
  */
-async function loadSpeakerModel(lib, { device, progress_callback } = {}) {
-  if (cached) return cached;
+async function loadSpeakerModel(lib, which, { device, progress_callback } = {}) {
+  if (cached.has(which)) return cached.get(which);
   if (!lib?.AutoProcessor || !lib?.AutoModel) {
     throw new Error("이 라이브러리 버전은 화자 구분 모델을 지원하지 않습니다.");
   }
-  const [processor, model] = await Promise.all([
-    lib.AutoProcessor.from_pretrained(SPEAKER_MODEL, { progress_callback }),
-    // 26MB 뿐이라 정밀도를 낮추지 않는다. 낮추면 목소리 구별력이 떨어진다.
-    lib.AutoModel.from_pretrained(SPEAKER_MODEL, { dtype: "fp32", device, progress_callback }),
-  ]);
-  cached = { processor, model };
-  return cached;
+  const spec = SPEAKER_MODELS[which];
+  // 두 모델의 전처리가 같아 WeSpeaker 저장소의 설정을 같이 쓴다.
+  // 모델과 동시에 받지 않는다. 이 사이트에서 찾는 설정이 켜진 사이에 끼면 헛걸음한다.
+  const processor = await lib.AutoProcessor.from_pretrained(SPEAKER_MODEL, { progress_callback });
+  // 26~40MB 뿐이라 정밀도를 낮추지 않는다. 낮추면 목소리 구별력이 떨어진다.
+  const model = spec.fromThisSite
+    ? await loadFromThisSite(lib, spec.id, progress_callback)
+    : await lib.AutoModel.from_pretrained(spec.id, { dtype: "fp32", device, progress_callback });
+  const entry = { processor, model, sameSpeaker: spec.sameSpeaker, sameSpeakerWithLimit: spec.sameSpeakerWithLimit };
+  cached.set(which, entry);
+  return entry;
+}
+
+/**
+ * 이 사이트에 올려 둔 모델을 받는다.
+ *
+ * 라이브러리는 평소 Hugging Face 에서만 받도록 막아 두었다(engine.js). 이 모델을 받는 동안만
+ * 열고 바로 되돌린다. 열어 둔 채로 두면 받아쓰기 모델까지 이 사이트에서 먼저 찾느라 헛걸음한다.
+ * 그래픽 가속(WebGPU)에서 만들다 실패하면 같은 작업자 안의 이후 모델이 전부 실패하므로
+ * 일반 모드(wasm)로 만든다.
+ */
+async function loadFromThisSite(lib, path, progress_callback) {
+  const before = lib.env.allowLocalModels;
+  lib.env.allowLocalModels = true;
+  try {
+    return await lib.AutoModel.from_pretrained(path, { dtype: "fp32", device: "wasm", progress_callback });
+  } finally {
+    lib.env.allowLocalModels = before;
+  }
 }
 
 /** 모델이 돌려준 결과에서 목소리 지문 벡터를 꺼낸다. */
@@ -239,16 +312,26 @@ export function toSpeakerNames(total, usable, labels) {
  * @param {Float32Array} audio 16kHz 모노 오디오 전체
  * @param {{start:number,end:number}[]} segments 받아쓰기 구간
  * @param {number} sampleRate
- * @param {{transformers?:object, device?:string, maxSpeakers?:number, onProgress?:Function, onSegment?:Function}} options
+ * @param {{transformers?:object, device?:string, language?:string, maxSpeakers?:number, onProgress?:Function, onSegment?:Function}} options
  * @returns {Promise<string[]>} 구간과 같은 길이의 화자 이름 배열
  */
 export async function assignSpeakers(audio, segments, sampleRate, options = {}) {
   if (segments.length < 2) return segments.map(() => "화자1");
 
-  const { processor, model } = await loadSpeakerModel(options.transformers, {
+  const load = (which) => loadSpeakerModel(options.transformers, which, {
     device: options.device === "webgpu" ? "webgpu" : "wasm",
     progress_callback: options.onProgress,
   });
+  const preferred = speakerModelFor(options.language, segments);
+  let speaker;
+  try {
+    speaker = await load(preferred);
+  } catch (error) {
+    if (preferred === "default") throw error;
+    // 한국어 모델을 못 받으면 원래 모델로라도 가른다.
+    speaker = await load("default");
+  }
+  const { processor, model } = speaker;
 
   const strong = [];   // 무리를 만드는 데 쓸 만큼 긴 구간
   const weak = [];     // 지문은 뽑히지만 짧아서 무리 만들기에는 안 쓰는 구간
@@ -280,7 +363,8 @@ export async function assignSpeakers(audio, segments, sampleRate, options = {}) 
 
   if (strong.length < 2) return segments.map(() => "화자1");
 
-  const labels = clusterByAffinity(strong.map((s) => s.vector), SAME_SPEAKER, options.maxSpeakers || MAX_SPEAKERS);
+  const threshold = options.maxSpeakers ? speaker.sameSpeakerWithLimit : speaker.sameSpeaker;
+  const labels = clusterByAffinity(strong.map((s) => s.vector), threshold, options.maxSpeakers || MAX_SPEAKERS);
   const centroids = centroidsOf(strong.map((s) => s.vector), labels);
 
   const judged = strong

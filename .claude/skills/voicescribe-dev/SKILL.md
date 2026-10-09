@@ -92,6 +92,13 @@ cd voicescribe && .venv/bin/python -m ruff check src tests
     (그래픽 가속이 끊기면 `resume` 으로 이어서 하는 이유).
 14. **아이폰 탭 메모리 한도는 약 1.5GB** — 크롬 실측 '큼' +4GB, '보통' +1.1GB. 아이폰에는
     '큼' 을 내놓지 않는다. 사파리는 COEP `credentialless` 를 몰라 격리가 안 된다(CPU 1개).
+15. **웹 화자 구분은 언어별로 모델이 둘이다** — 한국어는 `speaker-model/eres2net-base/`(저장소에 직접 넣음),
+    그 밖은 Hugging Face 의 WeSpeaker. ERes2Net 은 영어 회의에서 더 나빠서 나눴다.
+    - 같은 사이트의 모델은 transformers.js 에 **경로**(`/voice-record/speaker-model/...`)로 준다. 전체 URL 을
+      주면 "invalid model ID" 로 거부된다. 받는 동안만 `env.allowLocalModels` 를 켜고 꼭 되돌린다.
+    - 최상위 `/models/` 는 `.gitignore` 에 걸려 있어 그 아래에 두면 커밋되지 않는다.
+    - 모델 파일은 Git LFS 로 바꾸면 안 된다(GitHub Pages 가 LFS 를 내주지 않는다). 100MB 를 넘기지 않는다.
+    - 기준값은 모델마다 다르다. ERes2Net 을 WeSpeaker 기준(0.35)으로 쓰면 안 된다.
 
 ## MCP 서버 수정
 

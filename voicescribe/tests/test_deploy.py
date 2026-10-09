@@ -1135,3 +1135,143 @@ class TestRunawayRepeatsInTheBrowser:
         engine = (WEB_DIR / "engine.js").read_text(encoding="utf-8")
         loop = engine[engine.index("for (let i = startIndex; i < windows.length; i++)") :][:2500]
         assert "squashRepeats(" in loop, "받아쓴 구간마다 정리하지 않습니다"
+
+
+#: 한국어 화자 구분 모델. 저장소(=웹사이트)에 같이 올려 같은 주소에서 받는다.
+KOREAN_MODEL_DIR = WEB_DIR.parent.parent.parent / "speaker-model" / "eres2net-base"
+
+
+def _fake_speaker_lib(fail_local: bool) -> str:
+    """진짜 모델 대신 쓰는 가짜 라이브러리. 소리가 +면 A, -면 B 의 지문을 돌려준다."""
+    return f"""
+    const loaded = [];
+    const env = {{ allowLocalModels: false }};
+    const unit = (axis) => {{ const v = new Float32Array(4); v[axis] = 1; return v; }};
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const lib = {{
+      env,
+      // 진짜 라이브러리처럼 파일을 받는 데 시간이 걸린다. 그 사이의 설정 값을 적어 둔다.
+      AutoProcessor: {{ from_pretrained: async (id) => {{ await sleep(0);
+        loaded.push("processor " + id + " local=" + env.allowLocalModels);
+        return async (audio) => ({{ input_features: audio }}); }} }},
+      AutoModel: {{ from_pretrained: async (id) => {{
+        loaded.push("model " + id + " local=" + env.allowLocalModels);
+        await sleep(10);
+        if ({str(fail_local).lower()} && !id.includes("wespeaker")) throw new Error("404");
+        return async (inputs) => ({{ embeddings: {{ data: unit(inputs.input_features[0] > 0 ? 0 : 1) }} }}); }} }},
+    }};
+    const second = (sign) => new Float32Array(16000).fill(0.5 * sign);
+    const audio = new Float32Array([...second(1), ...second(-1), ...second(1), ...second(-1)]);
+    const segments = (text) => [0, 1, 2, 3].map((t) => ({{ start: t, end: t + 1, text }}));
+    """
+
+
+class TestKoreanSpeakerModel:
+    """한국어 녹음은 ERes2Net, 그 밖은 지금 모델(WeSpeaker)로 화자를 가른다(2026-10-09 사용자 결정).
+
+    웹과 같은 방식으로 재 보니 한국어 2인 대화(원음)는 ERes2Net 이 74% → 82% 로 나았지만
+    영어 회의는 76% → 66~69% 로 나빴다. 한국어와 영어를 둘 다 많이 쓰므로 둘을 나눠 쓴다.
+    """
+
+    def test_picks_the_model_by_language(self):
+        out = _run_node(f"""
+        const {{ speakerModelFor }} = await import("{(WEB_DIR / 'diarize.js').as_posix()}");
+        const seg = (text) => [{{ text }}];
+        console.log(JSON.stringify([
+          speakerModelFor("ko", seg("hello")),
+          speakerModelFor("en", seg("안녕하세요")),
+          speakerModelFor("ja", seg("こんにちは")),
+          speakerModelFor("auto", seg("오늘 회의는 여기까지 하겠습니다")),
+          speakerModelFor("auto", seg("Let's wrap up the meeting here, 감사")),
+          speakerModelFor(null, seg("그래서 API 를 바꿨어요")),
+          speakerModelFor("auto", seg("")),
+        ]));
+        """)
+        assert json.loads(out) == ["korean", "default", "default", "korean", "default", "korean", "default"]
+
+    def test_korean_recording_uses_eres2net_from_the_same_site(self):
+        out = _run_node(_fake_speaker_lib(fail_local=False) + f"""
+        const {{ assignSpeakers }} = await import("{(WEB_DIR / 'diarize.js').as_posix()}");
+        const labels = await assignSpeakers(audio, segments("네 맞아요"), 16000, {{ transformers: lib, language: "ko" }});
+        console.log(JSON.stringify({{ labels, loaded, localAfter: env.allowLocalModels }}));
+        """)
+        result = json.loads(out)
+        assert result["labels"] == ["화자1", "화자2", "화자1", "화자2"]
+        models = [x for x in result["loaded"] if x.startswith("model ")]
+        assert len(models) == 1 and models[0].endswith("/speaker-model/eres2net-base local=true"), result["loaded"]
+        assert result["localAfter"] is False, "다른 모델까지 이 사이트에서 찾게 됩니다. 설정을 되돌려야 합니다"
+        processors = [x for x in result["loaded"] if x.startswith("processor ")]
+        assert processors and all(x.endswith("local=false") for x in processors), (
+            "전처리 설정을 받는 동안 '이 사이트에서 찾기' 가 켜져 있었습니다: " + str(processors)
+        )
+
+    def test_falls_back_to_wespeaker_when_the_korean_model_fails(self):
+        out = _run_node(_fake_speaker_lib(fail_local=True) + f"""
+        const {{ assignSpeakers }} = await import("{(WEB_DIR / 'diarize.js').as_posix()}");
+        const labels = await assignSpeakers(audio, segments("네 맞아요"), 16000, {{ transformers: lib, language: "ko" }});
+        console.log(JSON.stringify({{ labels, loaded, localAfter: env.allowLocalModels }}));
+        """)
+        result = json.loads(out)
+        assert result["labels"] == ["화자1", "화자2", "화자1", "화자2"], "한국어 모델을 못 받으면 화자 구분이 통째로 빠집니다"
+        assert any("wespeaker" in x for x in result["loaded"] if x.startswith("model "))
+        assert result["localAfter"] is False
+
+    def test_english_recording_keeps_wespeaker(self):
+        out = _run_node(_fake_speaker_lib(fail_local=False) + f"""
+        const {{ assignSpeakers }} = await import("{(WEB_DIR / 'diarize.js').as_posix()}");
+        await assignSpeakers(audio, segments("sounds good"), 16000, {{ transformers: lib, language: "auto" }});
+        console.log(JSON.stringify(loaded.filter((x) => x.startsWith("model "))));
+        """)
+        models = json.loads(out)
+        assert len(models) == 1 and "wespeaker" in models[0], models
+
+    def test_korean_thresholds_depend_on_whether_the_headcount_is_known(self):
+        """ERes2Net 은 인원이 '자동' 일 때와 정해졌을 때 기준값이 다르다(2026-10-09 측정).
+
+        한국어 평가셋 19개(실제 2인 대화 12·3~4인 회의 4·혼자 3, 웹과 같은 Whisper small 구간)에서
+          자동     0.20~0.24 → 인원 정확 10~11/19, 0.26 부터 6/19 로 쪼개짐 → 가운데 0.22
+          인원 지정 0.35      → 18/19, 2인 대화 12/12 (0.25 는 전화 음질 하나를 1명으로 합침)
+        같은 자리에서 지금 웹(WeSpeaker 0.35) 자동은 3/19 였다 — 2인 통화를 4~8명으로 쪼갰다.
+        """
+        out = _run_node(f"""
+        const {{ SPEAKER_MODELS }} = await import("{(WEB_DIR / 'diarize.js').as_posix()}");
+        console.log(JSON.stringify(SPEAKER_MODELS));
+        """)
+        models = json.loads(out)
+        assert models["korean"]["sameSpeaker"] == 0.22
+        assert models["korean"]["sameSpeakerWithLimit"] == 0.35
+        assert models["default"]["sameSpeaker"] == models["default"]["sameSpeakerWithLimit"] == 0.35, (
+            "영어 등은 바꾸지 않기로 했습니다"
+        )
+
+    def test_known_headcount_uses_its_own_threshold(self):
+        """두 사람 목소리 유사도가 0.3 이면: 자동(0.22)은 한 명으로 합치고, 2명으로 정하면(0.35) 둘로 남긴다."""
+        lib = _fake_speaker_lib(fail_local=False).replace(
+            "unit(inputs.input_features[0] > 0 ? 0 : 1)",
+            "(inputs.input_features[0] > 0 ? unit(0) : Float32Array.from([0.3, Math.sqrt(1 - 0.09), 0, 0]))",
+        )
+        out = _run_node(lib + f"""
+        const {{ assignSpeakers }} = await import("{(WEB_DIR / 'diarize.js').as_posix()}");
+        const auto = await assignSpeakers(audio, segments("네 맞아요"), 16000, {{ transformers: lib, language: "ko" }});
+        const two = await assignSpeakers(audio, segments("네 맞아요"), 16000, {{ transformers: lib, language: "ko", maxSpeakers: 2 }});
+        console.log(JSON.stringify([new Set(auto).size, new Set(two).size]));
+        """)
+        assert json.loads(out) == [1, 2]
+
+    def test_engine_passes_the_language(self):
+        engine = (WEB_DIR / "engine.js").read_text(encoding="utf-8")
+        call = engine[engine.index("await assignSpeakers(") :][:900]
+        assert "language: request.language" in call
+
+    def test_model_files_are_in_the_repository(self):
+        """GitHub 릴리스 파일은 브라우저가 직접 못 받는다(CORS). 그래서 사이트에 같이 올린다."""
+        config = json.loads((KOREAN_MODEL_DIR / "config.json").read_text(encoding="utf-8"))
+        assert config["model_type"] == "wespeaker-resnet", "transformers.js 가 읽는 형식이어야 합니다"
+        onnx = KOREAN_MODEL_DIR / "onnx" / "model.onnx"
+        head = onnx.read_bytes()[:200]
+        assert not head.startswith(b"version https://git-lfs"), "GitHub Pages 는 LFS 파일을 내주지 않습니다"
+        size = onnx.stat().st_size
+        assert 30_000_000 < size < 95_000_000, f"{size} 바이트 — GitHub 는 100MB 넘는 파일을 거부합니다"
+        assert b"input_features" in onnx.read_bytes()[-200_000:] or b"input_features" in onnx.read_bytes()[:200_000]
+        notice = (KOREAN_MODEL_DIR / "README.md").read_text(encoding="utf-8")
+        assert "Apache" in notice and "eres2net" in notice.lower(), "출처와 라이선스를 밝혀야 합니다"
