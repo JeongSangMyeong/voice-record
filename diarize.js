@@ -85,7 +85,7 @@ const MAX_EMBED_SECONDS = 10;
 const cached = new Map();
 
 /**
- * 파일 이름으로 인원 상한을 짐작한다. '통화녹음_이름' 같은 통화 녹음이면 2, 모르면 null.
+ * 파일 이름으로 인원 상한을 짐작한다. '통화 누나_날짜', '통화녹음_이름' 같은 통화 녹음이면 2, 모르면 null.
  *
  * 화자 구분이 틀리는 가장 큰 원인이 인원 추측이다. 상한을 2로 두면 한 사람을 여럿으로
  * 쪼개는 실수를 막고, 혼잣말 파일은 그대로 한 명으로 남는다. '통화정책 회의', '전화회의'
@@ -94,7 +94,8 @@ const cached = new Map();
 export function speakerLimitFromFileName(name) {
   const stem = String(name || "").split(/[\\/]/).pop();
   if (/회의|conference|meeting|컨퍼런스/i.test(stem)) return null;
-  return /통화\s*녹음|전화|(?<![a-z])call(?![a-z])/i.test(stem) ? 2 : null;
+  // 아이폰 통화 녹음은 '통화 상대_날짜_시각.m4a' 로 저장된다(실제 파일 이름).
+  return /^통화[\s_(]|통화\s*녹음|전화|(?<![a-z])call(?![a-z])/i.test(stem) ? 2 : null;
 }
 
 /**

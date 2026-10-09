@@ -1136,6 +1136,157 @@ class TestRunawayRepeatsInTheBrowser:
         loop = engine[engine.index("for (let i = startIndex; i < windows.length; i++)") :][:2500]
         assert "squashRepeats(" in loop, "받아쓴 구간마다 정리하지 않습니다"
 
+    def test_same_cases_as_the_pc_version(self):
+        from .test_engines_and_pipeline import SQUASH_CASES
+
+        texts = json.dumps([text for text, _ in SQUASH_CASES], ensure_ascii=False)
+        out = _run_node(f"""
+        const {{ squashRepeats }} = await import("{(WEB_DIR / 'engine.js').as_posix()}");
+        console.log(JSON.stringify({texts}.map((t) => squashRepeats(t))));
+        """)
+        assert json.loads(out) == [expected for _, expected in SQUASH_CASES], "PC판과 정리 결과가 다릅니다"
+
+
+class TestRepeatedSentencesAreSquashed:
+    """문장(구간) 단위로 같은 말을 되풀이하는 것도 정리한다(2026-10-09, 실제 브라우저로 확인).
+
+    알아듣기 어려운 영어 녹음에서 "No, what?" 가 구간 12개로, "Welcome to the start." / "Okay." 가 번갈아
+    세 번 나왔다. 한 문장 안의 되풀이(squashRepeats)로는 잡히지 않는다.
+    두 낱말 이상 문장은 세 번부터 한 번만, 한 낱말("네.")은 여섯 번부터 두 번만, 여러 문장 묶음은 세 번부터 한 번만.
+    """
+
+    def _squash(self, texts: list[str]) -> list[str]:
+        chunks = json.dumps([{"start": i, "end": i + 1, "text": t} for i, t in enumerate(texts)], ensure_ascii=False)
+        out = _run_node(f"""
+        const {{ squashRepeatedChunks }} = await import("{(WEB_DIR / 'engine.js').as_posix()}");
+        console.log(JSON.stringify(squashRepeatedChunks({chunks}).map((c) => c.text)));
+        """)
+        return json.loads(out)
+
+    def test_same_sentence_many_times(self):
+        assert self._squash(["Is there a guitar?"] + ["No, what?"] * 12 + ["Stop!"]) == [
+            "Is there a guitar?", "No, what?", "Stop!",
+        ]
+
+    def test_alternating_pair(self):
+        texts = ["Welcome to the start.", "Sorry.", "Okay.", "Welcome to the start.", "Okay.",
+                 "Welcome to the start.", "Okay.", "Welcome to the start.", "Is there a guitar?"]
+        assert self._squash(texts) == ["Welcome to the start.", "Sorry.", "Okay.", "Welcome to the start.",
+                                       "Is there a guitar?"]
+
+    def test_real_conversation_stays(self):
+        for texts in (["네.", "네.", "네."], ["여보세요?", "여보세요?"],
+                      ["알겠습니다 감사합니다.", "알겠습니다 감사합니다."], ["어.", "응.", "어.", "응."]):
+            assert self._squash(texts) == texts
+
+    def test_one_word_runaway(self):
+        assert self._squash(["네."] * 7 + ["알겠습니다."]) == ["네.", "네.", "알겠습니다."]
+
+    def test_applied_to_the_whole_result(self):
+        engine = (WEB_DIR / "engine.js").read_text(encoding="utf-8")
+        run = engine[engine.index("async function runWhisper") :]
+        run = run[: run.index("\n}\n")]
+        assert "squashRepeatedChunks(collected)" in run, "받아쓴 결과 전체에 적용하지 않습니다"
+
+
+class TestUpdatesReachTheWorker:
+    """작업자가 engine.js 를 버전 표시 없이 불러 와, 고친 뒤에도 브라우저가 옛 파일을 쓰고 있었다(2026-10-09).
+
+    화면은 worker.js?v=버전 으로 띄우지만 그 안의 `import "./engine.js"` 에는 버전이 붙지 않는다.
+    실제로 고친 코드를 브라우저로 돌렸는데 옛 결과가 나와서 알았다. GitHub Pages 는 10분까지 옛 파일을 준다.
+    """
+
+    def test_worker_loads_the_engine_with_the_version(self):
+        worker = (WEB_DIR / "worker.js").read_text(encoding="utf-8")
+        assert not re.search(r'^import .* from "\./engine\.js";', worker, re.M), "버전 없이 불러옵니다"
+        assert "import.meta.url" in worker and "engine.js?v=" in worker
+
+    def test_worker_still_falls_back_when_the_engine_fails_to_load(self):
+        """불러오기에 실패하면 예전처럼 작업자 오류가 나야 화면 쪽이 직접 처리한다(index.html 의 error 처리)."""
+        worker = (WEB_DIR / "worker.js").read_text(encoding="utf-8")
+        assert "throw error" in worker[worker.index(".catch(") : worker.index(".catch(") + 200]
+
+    def test_engine_loads_diarize_with_the_same_version(self):
+        engine = (WEB_DIR / "engine.js").read_text(encoding="utf-8")
+        assert 'await import("./diarize.js")' not in engine
+        assert "./diarize.js${" in engine and "import.meta.url" in engine
+
+
+class TestAutoLanguageReallyDetects:
+    """'자동 감지' 가 실제로는 언어를 고르지 않고 영어로 받아쓰고 있었다(2026-10-09, 사용자 통화 녹음으로 확인).
+
+    transformers.js 는 언어를 안 주면 경고만 남기고 영어로 정한다(modeling_whisper.js 'defaulting to English').
+    그래서 한국어 통화가 영어 번역으로 나왔고, 같은 말을 되풀이했다('It's a stormy wind. It's a stormy wind.').
+    Whisper 가 원래 하는 방식대로 첫 말소리를 듣고 언어 기호 중 가장 그럴듯한 것을 고른다.
+    """
+
+    def _detect(self, scores: dict[str, float], dtype: str = "float32") -> str:
+        out = _run_node(f"""
+        const {{ detectLanguage }} = await import("{(WEB_DIR / 'engine.js').as_posix()}");
+        const ids = {{ "<|en|>": 1, "<|ko|>": 2, "<|ja|>": 3, "<|jw|>": 4, "<|zh|>": 5 }};
+        const scores = {json.dumps(scores)};
+        const logits = new Float32Array(8).fill(-100);
+        for (const [code, value] of Object.entries(scores)) logits[ids[`<|${{code}}|>`]] = value;
+        const seen = {{}};
+        class Tensor {{ constructor(type, data, dims) {{ Object.assign(this, {{ type, data, dims }}); }} }}
+        const asr = {{
+          processor: async (audio) => {{ seen.audio = audio.length; return {{ input_features: "특징" }}; }},
+          model: Object.assign(async (inputs) => {{
+            seen.start = Number(inputs.decoder_input_ids.data[0]);
+            const tensor = {{ type: "{dtype}", data: logits, to: () => ({{ type: "float32", data: logits }}) }};
+            if ("{dtype}" !== "float32") tensor.data = null;
+            return {{ logits: tensor }};
+          }}, {{ generation_config: {{ decoder_start_token_id: 7, lang_to_id: ids }} }}),
+        }};
+        const language = await detectLanguage(asr, new Float32Array(16000), {{ Tensor }});
+        console.log(JSON.stringify({{ language, seen }}));
+        """)
+        return json.loads(out)
+
+    def test_picks_the_most_likely_language(self):
+        result = self._detect({"en": 1.0, "ko": 3.0, "ja": 2.0})
+        assert result["language"] == "ko"
+        assert result["seen"]["start"] == 7, "시작 기호 다음에 올 말을 봐야 합니다"
+
+    def test_only_languages_the_site_offers(self):
+        """화면에 없는 언어(자바어 jw 등)로 잘못 고르면 엉뚱한 글이 나온다. 고를 수 있는 언어 중에서만 고른다."""
+        assert self._detect({"jw": 9.0, "ko": 3.0, "en": 1.0})["language"] == "ko"
+
+    def test_half_precision_scores(self):
+        """그래픽 가속(q4f16)에서는 점수가 16비트로 나온다. 그대로 비교하면 틀린다."""
+        assert self._detect({"en": 1.0, "ko": 3.0}, dtype="float16")["language"] == "ko"
+
+    def test_offered_languages_match_the_screen(self):
+        out = _run_node(f"""
+        const {{ AUTO_LANGUAGES }} = await import("{(WEB_DIR / 'engine.js').as_posix()}");
+        console.log(JSON.stringify(AUTO_LANGUAGES));
+        """)
+        html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+        select = html[html.index('<select id="lang">') : html.index("</select>", html.index('<select id="lang">'))]
+        offered = [v for v in re.findall(r'value="([a-z]+)"', select) if v != "auto"]
+        assert sorted(json.loads(out)) == sorted(offered)
+
+    def test_never_hands_null_language_to_the_library(self):
+        engine = (WEB_DIR / "engine.js").read_text(encoding="utf-8")
+        run = engine[engine.index("async function runWhisper") :]
+        run = run[: run.index("\n}\n")]
+        assert 'language === "auto" ? null' not in run, "자동이면 라이브러리가 영어로 정해 버립니다"
+        assert "detectLanguage(" in run
+        assert 'catch' in run[run.index("detectLanguage(") - 200 : run.index("detectLanguage(") + 400], (
+            "언어를 못 알아내도 받아쓰기는 해야 합니다"
+        )
+        assert "language: chosen" in run[run.index("lost.resume") - 10 : run.index("lost.resume") + 120], (
+            "그래픽 가속이 끊겨 이어서 할 때 언어를 다시 바꾸면 안 됩니다"
+        )
+
+    def test_shows_the_detected_language(self):
+        engine = (WEB_DIR / "engine.js").read_text(encoding="utf-8")
+        done = engine[engine.index('type: "done"') :][:400]
+        assert "language" in done, "감지한 언어를 화면에 넘기지 않습니다"
+        html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+        show = html[html.index("function showResult") :][:2200]
+        assert "d.language" in show, "감지한 언어를 보여 주지 않습니다"
+
 
 #: 한국어 화자 구분 모델. 저장소(=웹사이트)에 같이 올려 같은 주소에서 받는다.
 KOREAN_MODEL_DIR = WEB_DIR.parent.parent.parent / "speaker-model" / "eres2net-base"
@@ -1261,7 +1412,7 @@ class TestKoreanSpeakerModel:
     def test_engine_passes_the_language(self):
         engine = (WEB_DIR / "engine.js").read_text(encoding="utf-8")
         call = engine[engine.index("await assignSpeakers(") :][:900]
-        assert "language: request.language" in call
+        assert "language: result.language || request.language" in call, "'자동' 이면 알아낸 언어를 넘겨야 합니다"
 
     def test_model_files_are_in_the_repository(self):
         """GitHub 릴리스 파일은 브라우저가 직접 못 받는다(CORS). 그래서 사이트에 같이 올린다."""

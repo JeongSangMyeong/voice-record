@@ -203,12 +203,13 @@ def _silhouette(distances: np.ndarray, labels: list[int]) -> float:
 # --------------------------------------------------------------------------- #
 
 
-_CALL_NAME = re.compile(r"통화\s*녹음|전화|(?<![a-z])call(?![a-z])", re.IGNORECASE)
+#: 아이폰 통화 녹음은 '통화 상대_날짜_시각.m4a' 로 저장된다(실제 파일 이름).
+_CALL_NAME = re.compile(r"^통화[\s_(]|통화\s*녹음|전화|(?<![a-z])call(?![a-z])", re.IGNORECASE)
 _GROUP_NAME = re.compile(r"회의|conference|meeting|컨퍼런스", re.IGNORECASE)
 
 
 def speakers_hint_from_name(name: str | Path) -> int | None:
-    """파일 이름으로 인원을 짐작한다. '통화녹음_이름' 같은 통화 녹음이면 2, 모르면 None.
+    """파일 이름으로 인원을 짐작한다. '통화 누나_날짜', '통화녹음_이름' 같은 통화 녹음이면 2, 모르면 None.
 
     화자 구분이 틀리는 가장 큰 원인이 인원 추측이라, 알 수 있으면 정해 주는 편이 낫다.
     '통화정책 회의', '전화회의' 처럼 여럿일 수 있는 이름은 짐작하지 않는다.

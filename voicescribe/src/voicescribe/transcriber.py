@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -45,14 +46,49 @@ class TranscribeRequest:
     extra: dict[str, object] = field(default_factory=dict)
 
 
+def _bare_word(word: str) -> str:
+    """낱말을 견줄 때 앞뒤 문장부호와 대소문자는 무시한다('wind.' 와 'wind' 는 같은 말)."""
+    return re.sub(r"^[\W_]+|[\W_]+$", "", word.lower())
+
+
+def _squash_phrases(words: list[str]) -> list[str]:
+    """여러 낱말이 통째로 연달아 되풀이되면 마지막 한 번만 남긴다(웹판 squashPhrases 와 같은 기준).
+
+    "I'm going to put the door I'm going to put the door" 처럼 문장째 되풀이한다(사용자 제보 2026-10-09).
+    세 낱말 이상은 두 번부터, 두 낱말은 "그 뭐냐 그 뭐냐" 처럼 실제로 두 번 말하므로 세 번부터 합친다.
+    """
+    out: list[str] = []
+    i = 0
+    while i < len(words):
+        merged = False
+        for n in range(min(8, (len(words) - i) // 2), 1, -1):
+            unit = [_bare_word(w) for w in words[i : i + n]]
+            times = 1
+            while i + (times + 1) * n <= len(words) and [
+                _bare_word(w) for w in words[i + times * n : i + (times + 1) * n]
+            ] == unit:
+                times += 1
+            if times >= (2 if n >= 3 else 3):
+                out.extend(words[i + (times - 1) * n : i + times * n])
+                i += times * n
+                merged = True
+                break
+        if not merged:
+            out.append(words[i])
+            i += 1
+    return out
+
+
 def squash_repeats(text: str, keep: int = 2, runaway: int = 6) -> str:
-    """같은 낱말이 runaway 번 이상 연달아 나오면 keep 번만 남긴다.
+    """되풀이를 정리한다. 같은 낱말이 runaway 번 이상 연달아 나오면 keep 번만, 여러 낱말이 통째로
+    되풀이되면 한 번만 남긴다.
 
     잡음에 빠진 Whisper 가 같은 말을 끝없이 되풀이한다(실제 회의 녹음에서 '아' 116번).
-    5번 이하는 실제로 그렇게 말했을 수 있어 그대로 둔다. call-agent 와 같은 기준이다.
+    한 낱말을 5번 이하로 말한 것은 실제로 그렇게 말했을 수 있어 그대로 둔다. call-agent 와 같은 기준이다.
     """
-    words = text.split()
-    if len(words) < runaway:
+    original = text.split()
+    words = _squash_phrases(original)
+    if len(words) == len(original) and len(words) < runaway:
         return text
     out: list[str] = []
     i = 0

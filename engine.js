@@ -469,15 +469,45 @@ export function tileAtPauses(audio, sampleRate, maxSeconds = WINDOW_SECONDS) {
   });
 }
 
+/** 낱말을 견줄 때 앞뒤 문장부호와 대소문자는 무시한다("wind." 와 "wind" 는 같은 말). */
+const bareWord = (word) => word.toLowerCase().replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, "");
+
 /**
- * 같은 낱말이 6번 이상 연달아 나오면 2번만 남긴다.
+ * 여러 낱말이 통째로 연달아 되풀이되면 마지막 한 번만 남긴다.
+ *
+ * "I'm going to put the door I'm going to put the door" 처럼 문장째 되풀이한다(사용자 제보 2026-10-09).
+ * 세 낱말 이상은 두 번부터 합친다. 두 낱말은 "그 뭐냐 그 뭐냐" 처럼 실제로 두 번 말하므로 세 번부터.
+ * 마지막 것을 남기는 이유: 문장 끝 부호가 보통 마지막에 붙어 있다.
+ */
+function squashPhrases(words) {
+  const out = [];
+  for (let i = 0; i < words.length;) {
+    let merged = false;
+    for (let n = Math.min(8, Math.floor((words.length - i) / 2)); n >= 2 && !merged; n--) {
+      const same = (a, b) => words.slice(a, a + n).every((w, k) => bareWord(w) === bareWord(words[b + k]));
+      let times = 1;
+      while (i + (times + 1) * n <= words.length && same(i, i + times * n)) times++;
+      if (times >= (n >= 3 ? 2 : 3)) {
+        out.push(...words.slice(i + (times - 1) * n, i + times * n));
+        i += times * n;
+        merged = true;
+      }
+    }
+    if (!merged) out.push(words[i++]);
+  }
+  return out;
+}
+
+/**
+ * 되풀이를 정리한다. 같은 낱말이 6번 이상 연달아 나오면 2번만, 여러 낱말이 통째로 되풀이되면 한 번만 남긴다.
  *
  * 잡음에 빠진 Whisper 가 같은 말을 끝없이 되풀이한다(실제 회의 녹음에서 '아' 116번).
- * 5번 이하는 실제로 그렇게 말했을 수 있어 그대로 둔다. PC판·call-agent 와 같은 기준이다.
+ * 한 낱말을 5번 이하로 말한 것은 실제로 그렇게 말했을 수 있어 그대로 둔다. PC판·call-agent 와 같은 기준이다.
  */
 export function squashRepeats(text, keep = 2, runaway = 6) {
-  const words = text.split(/\s+/).filter(Boolean);
-  if (words.length < runaway) return text;
+  const original = text.split(/\s+/).filter(Boolean);
+  const words = squashPhrases(original);
+  if (words.length === original.length && words.length < runaway) return text;
   const out = [];
   for (let i = 0; i < words.length;) {
     let j = i;
@@ -486,6 +516,75 @@ export function squashRepeats(text, keep = 2, runaway = 6) {
     i = j;
   }
   return out.join(" ");
+}
+
+/**
+ * 같은 문장(구간)을 연달아 되풀이하면 정리한다.
+ *
+ * 알아듣기 어려운 녹음에서 Whisper 가 "No, what?" 를 구간 12개로 내놓거나, 두 문장을 번갈아 되풀이했다
+ * (2026-10-09, 실제 브라우저로 확인). 한 문장 안의 되풀이(squashRepeats)로는 잡히지 않는다.
+ *   - 같은 문장: 두 낱말 이상이면 세 번부터 한 번만, 한 낱말("네.")이면 여섯 번부터 두 번만
+ *   - 여러 문장 묶음(합쳐 세 낱말 이상): 세 번부터 한 번만. "어. 응. 어. 응." 같은 맞장구는 그대로 둔다.
+ *
+ * @param {{start:number, end:number, text:string}[]} chunks
+ * @returns {{start:number, end:number, text:string}[]} 새 배열
+ */
+export function squashRepeatedChunks(chunks) {
+  const key = (c) => (c.text || "").split(/\s+/).filter(Boolean).map(bareWord).join(" ");
+  const wordCount = (list) => list.reduce((sum, c) => sum + key(c).split(" ").filter(Boolean).length, 0);
+  const out = [];
+  for (let i = 0; i < chunks.length;) {
+    let merged = false;
+    for (let n = 1; n <= Math.min(4, Math.floor((chunks.length - i) / 2)) && !merged; n++) {
+      const block = chunks.slice(i, i + n);
+      const same = (at) => block.every((c, k) => key(c) === key(chunks[at + k]));
+      let times = 1;
+      while (i + (times + 1) * n <= chunks.length && same(i + times * n)) times++;
+      const words = wordCount(block);
+      const oneWord = n === 1 && words < 2;
+      const enough = n === 1 ? times >= (oneWord ? 6 : 3) : times >= 3 && words >= 3;
+      if (enough) {
+        const kept = oneWord ? 2 : 1;
+        out.push(...chunks.slice(i + (times - kept) * n, i + times * n));
+        i += times * n;
+        merged = true;
+      }
+    }
+    if (!merged) out.push(chunks[i++]);
+  }
+  return out;
+}
+
+/** '자동 감지' 일 때 고를 수 있는 언어. 화면의 언어 목록과 같아야 한다(테스트가 확인한다). */
+export const AUTO_LANGUAGES = ["ko", "en", "ja", "zh", "es", "fr", "de", "vi"];
+
+/**
+ * 녹음의 언어를 알아낸다.
+ *
+ * 라이브러리는 언어를 비워 넘기면 알아내지 않고 영어로 정해 버린다. 그래서 '자동 감지' 로 한국어 통화를
+ * 올리면 영어 번역이 나오고 같은 말을 되풀이했다(2026-10-09, 사용자 통화 녹음으로 확인).
+ * Whisper 가 원래 하는 방식대로, 시작 기호 다음에 올 언어 기호 중 가장 그럴듯한 것을 고른다.
+ * 화면에 없는 언어(자바어 등)로 잘못 고르지 않게 고를 수 있는 언어 중에서만 고른다.
+ *
+ * @param {object} asr 받아쓰기 파이프라인
+ * @param {Float32Array} audio 30초 이하의 말소리
+ * @param {{Tensor: Function, candidates?: string[]}} options
+ * @returns {Promise<string>} 언어 코드("ko" 등)
+ */
+export async function detectLanguage(asr, audio, { Tensor, candidates = AUTO_LANGUAGES }) {
+  const config = asr.model.generation_config;
+  const { input_features } = await asr.processor(audio);
+  const start = new Tensor("int64", BigInt64Array.from([BigInt(config.decoder_start_token_id)]), [1, 1]);
+  const { logits } = await asr.model({ input_features, decoder_input_ids: start });
+  // 그래픽 가속(q4f16)에서는 점수가 16비트로 나온다. 그대로 견주면 틀린다.
+  const scores = (logits.type === "float32" ? logits : logits.to("float32")).data;
+  let best = null;
+  for (const code of candidates) {
+    const id = config.lang_to_id?.[`<|${code}|>`];
+    if (id !== undefined && (best === null || scores[id] > scores[best.id])) best = { code, id };
+  }
+  if (!best) throw new Error("언어를 알아내지 못했습니다.");
+  return best.code;
 }
 
 /** 오디오를 받아쓴다(내부 구현). */
@@ -516,8 +615,21 @@ async function runWhisper(request, onEvent) {
   const collected = resume ? [...resume.chunks] : [];
   let text = resume?.text || "";
 
+  // '자동 감지' 면 첫 말소리를 듣고 언어를 고른다(detectLanguage 참고). 이어서 하는 중이면 앞서 고른 것을 쓴다.
+  // 못 알아내면 이 사이트에서 가장 많이 쓰는 한국어로 한다. 영어로 두면 한국어 녹음이 번역되어 나온다.
+  let chosen = resume?.language || language;
+  if (chosen === "auto") {
+    try {
+      chosen = windows.length
+        ? await detectLanguage(asr, audio.subarray(windows[0].from, windows[0].to), { Tensor: libRef.Tensor })
+        : "ko";
+    } catch {
+      chosen = "ko";
+    }
+  }
+
   const options = {
-    language: language === "auto" ? null : language,
+    language: chosen,
     task: "transcribe",
     return_timestamps: true,
     chunk_length_s: 0,   // 창이 이미 30초 이하라 추가로 자를 필요가 없다
@@ -537,7 +649,7 @@ async function runWhisper(request, onEvent) {
         // 작업자에서는 화면 쪽이 새 작업자로 이어서 하므로 이 문구가 보이지 않는다.
         // 화면에서 직접 처리하던 중이면 페이지 전체가 같은 줄에 묶여 있어 새로고침밖에 없다.
         const lost = new Error("그래픽 가속이 끊겼습니다. 페이지를 새로 고친 뒤 다시 시도해 주세요.");
-        lost.resume = { from: i, text, chunks: collected };
+        lost.resume = { from: i, text, chunks: collected, language: chosen };
         throw lost;
       }
       throw error;
@@ -561,11 +673,14 @@ async function runWhisper(request, onEvent) {
       remaining: (spent / (done - startIndex)) * (windows.length - done),
     });
   }
+  // 같은 문장을 연달아 되풀이한 것은 한 번만 남긴다. 줄었으면 전체 글도 남은 문장으로 다시 만든다.
+  const chunks = squashRepeatedChunks(collected);
   return {
-    text,
-    chunks: collected,
+    text: chunks.length === collected.length ? text : chunks.map((c) => c.text).join(" "),
+    chunks,
     elapsed: ((globalThis.performance || Date).now() - started) / 1000,
     device,
+    language: chosen,
   };
 }
 
@@ -595,12 +710,13 @@ export async function runTranscription(request, onEvent) {
     try {
       // 화자 구분도 같은 라이브러리의 목소리 모델을 쓴다. 아직이면 여기서 준비한다.
       if (!libRef) await loadLibrary();
-      const { assignSpeakers, speakerLimitFromFileName } = await import("./diarize.js");
+      // 이 파일과 같은 버전 표시(?v=)를 붙인다. 안 붙이면 브라우저가 옛 diarize.js 를 쓴다.
+      const { assignSpeakers, speakerLimitFromFileName } = await import(`./diarize.js${new URL(import.meta.url).search}`);
       const labels = await assignSpeakers(audio, chunks, sampleRate, {
         transformers: libRef,
         device,
-        // 한국어면 한국어에 강한 목소리 모델을 쓴다
-        language: request.language,
+        // 한국어면 한국어에 강한 목소리 모델을 쓴다('자동' 이면 알아낸 언어로)
+        language: result.language || request.language,
         // 사용자가 고른 사람 수가 먼저, 없으면 파일 이름으로 짐작(통화 녹음이면 2명)
         maxSpeakers: request.maxSpeakers || speakerLimitFromFileName(request.fileName),
         // 목소리 모델(26MB, 한국어는 40MB)도 처음 한 번은 내려받는다. 같은 진행률 막대를 쓴다.
@@ -630,5 +746,6 @@ export async function runTranscription(request, onEvent) {
     elapsed,
     duration: audio.length / sampleRate,
     device,   // 중간에 일반 모드로 갈아탔을 수 있다
+    language: result.language,   // '자동 감지' 였으면 알아낸 언어
   };
 }

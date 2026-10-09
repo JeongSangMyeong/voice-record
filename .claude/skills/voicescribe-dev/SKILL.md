@@ -102,6 +102,10 @@ cd voicescribe && .venv/bin/python -m ruff check src tests
     - 인원 '자동' 이면 말한 시간 10% 미만 무리를 가장 닮은 사람에게 합친다(`mergeQuietSpeakers`).
       영어는 목소리 모델이 원래 약해서(정답 구간으로도 2인 73%) 기준값만으로는 못 고쳤다.
       인원을 정했으면 합치지 않는다. 측정 스크립트: `~/.cache/voicescribe-bench/web-spk*/`
+16. **transformers.js 에 `language: null` 을 넘기면 언어를 알아내지 않고 영어로 정한다**(경고 한 줄뿐).
+    '자동 감지' 로 한국어 통화가 영어 번역으로 나오고 같은 문장을 되풀이했다(2026-10-09).
+    `detectLanguage` 로 직접 고른 뒤 넘긴다. 시험은 사용자 실제 파일(`D:\calls`)로도 돌려 볼 것 —
+    공개 평가셋만으로는 이 문제가 안 보였다.
 
 ## MCP 서버 수정
 

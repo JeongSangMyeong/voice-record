@@ -7,10 +7,21 @@
  * engine.js 를 직접 부른다.
  */
 
-import { runTranscription } from "./engine.js";
+// 화면이 worker.js?v=버전 으로 띄운다. engine.js 에도 같은 버전을 붙여야 브라우저가 옛 파일을 쓰지 않는다.
+// (버전 없이 불렀더니 고친 뒤에도 옛 engine.js 가 돌았다.)
+const version = new URL(import.meta.url).searchParams.get("v");
+const engine = import(version ? `./engine.js?v=${version}` : "./engine.js");
+// 불러오기에 실패하면 작업자 오류로 알린다. 그래야 화면 쪽이 직접 처리로 우회한다(index.html).
+engine.catch((error) => setTimeout(() => { throw error; }));
 
 self.addEventListener("message", async (event) => {
   const request = event.data;
+  let runTranscription;
+  try {
+    ({ runTranscription } = await engine);
+  } catch {
+    return;   // 위에서 작업자 오류로 알렸다
+  }
   try {
     const result = await runTranscription(request, (e) => self.postMessage(e));
     self.postMessage(result);

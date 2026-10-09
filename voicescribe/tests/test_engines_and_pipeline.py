@@ -210,6 +210,12 @@ CALL_NAME_CASES = [
     ("Call recording John_241007.m4a", 2),
     ("Call with Mom.m4a", 2),
     ("전화_엄마.m4a", 2),
+    # 아이폰 통화 녹음의 실제 이름(D:\\calls, 2026-10-09): '통화 상대_날짜_시각'
+    ("통화 누나_261006_214102.m4a", 2),
+    ("통화 (아이티스마트) 김종경부장님_261005_161451.m4a", 2),
+    ("통화 01029827301_260623_105351.m4a", 2),
+    ("통화_어머니.m4a", 2),
+    ("통화정책 보고서.m4a", None),    # '통화' 뒤에 바로 글자가 이어지면 통화 녹음이 아니다
     ("통화정책 회의.m4a", None),      # '통화' 가 돈(통화정책)일 때
     ("전화회의_팀.m4a", None),        # 여럿이 하는 전화 회의
     ("conference call.m4a", None),
@@ -260,21 +266,30 @@ class TestCallRecordingHint:
         assert self._captured(monkeypatch, two_speaker_wav) == {"min_speakers": None, "max_speakers": None}
 
 
+#: 웹판(engine.js squashRepeats)도 같은 사례로 검사한다(test_deploy.py).
+SQUASH_CASES = [
+    ("아 " * 116 + "근데 그건", "아 아 근데 그건"),
+    ("네 네 네 알겠습니다", "네 네 네 알겠습니다"),       # 5번 이하는 실제 말일 수 있다
+    ("", ""),
+    ("하나 둘 셋", "하나 둘 셋"),
+    # 여러 낱말이 통째로 되풀이되는 경우(사용자 제보 2026-10-09). 마지막 한 번만 남긴다.
+    ("I'm going to put the door I'm going to put the door", "I'm going to put the door"),
+    ("It's a stormy wind. It's a stormy wind.", "It's a stormy wind."),
+    ("그래서 내가 말했잖아 그래서 내가 말했잖아 진짜로", "그래서 내가 말했잖아 진짜로"),
+    ("그 뭐냐 그 뭐냐 그 뭐냐 그거", "그 뭐냐 그거"),           # 두 낱말은 세 번부터
+    ("그 뭐냐 그 뭐냐 그거", "그 뭐냐 그 뭐냐 그거"),           # 두 번은 실제 말일 수 있다
+    ("호박, 호박 조그만 거를", "호박, 호박 조그만 거를"),
+    ("교수야, 교수야.", "교수야, 교수야."),
+]
+
+
 class TestRunawayRepeats:
     """잡음에 빠진 Whisper 가 같은 낱말을 끝없이 되풀이한다(실제 회의 녹음: '아' 116번).
 
     call-agent(squash_repeats)와 같은 기준: 6번 이상 연달아 나오면 2번만 남긴다.
     """
 
-    @pytest.mark.parametrize(
-        ("text", "expected"),
-        [
-            ("아 " * 116 + "근데 그건", "아 아 근데 그건"),
-            ("네 네 네 알겠습니다", "네 네 네 알겠습니다"),       # 5번 이하는 실제 말일 수 있다
-            ("", ""),
-            ("하나 둘 셋", "하나 둘 셋"),
-        ],
-    )
+    @pytest.mark.parametrize(("text", "expected"), SQUASH_CASES)
     def test_squash(self, text, expected):
         from voicescribe.transcriber import squash_repeats
 
