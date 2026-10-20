@@ -55,44 +55,41 @@ cd voicescribe && .venv/bin/python -m ruff check src tests
 
 아래는 전부 이 저장소에서 직접 재현해 확인한 것이다. 되돌리지 말 것.
 
-1. **SenseVoice 모델 이름** — `sherpa-onnx-sense-voice-...-2024-07-17` 만 쓴다.
-   이름이 비슷한 `...-int8-2025-09-09` 는 광둥어 전용 파인튜닝이라 한국어가 깨지고
-   `language=` 인자도 무시한다. `tests/test_sensevoice.py` 가 이 이름을 검사한다.
-2. **VAD 청킹은 필수** — SenseVoice 는 긴 오디오를 통째로 넣으면 메모리가 제곱으로 늘어난다
-   (15분 → 13GB). 속도 최적화가 아니라 동작 조건이다.
-3. **VAD 여유 0.8초** — 잘린 구간(`vad.front.samples`)을 그대로 쓰면 한국어 띄어쓰기가 깨진다.
-   반드시 **원본 오디오**에서 앞뒤 0.8초 여유를 두고 다시 잘라야 한다.
-4. **sherpa VAD 프레임은 512 샘플 고정**(16kHz 기준). 다른 값을 넣으면 조용히 오작동한다.
-   또 이 API 의 시간 단위는 **초**다(pip `silero-vad` 패키지는 밀리초라 헷갈리기 쉽다).
-5. **화자 분리는 ERes2Net + 임계값 1.1** — 임계값은 임베딩 모델마다 다르다. CAM++ 는 0.8 이 맞았지만
+1. **SenseVoice 는 2026-10-20 에 뺐다** — 실제 회의 녹음에서 단어 경계가 무너지고 화자 구분이
+   안 됐다. 다시 넣지 말 것. `TestRegistry::test_sensevoice_is_gone` 이 막는다.
+2. **sherpa 모델에 긴 오디오를 넣을 때(bench)** — 통째로 넣으면 메모리가 제곱으로 늘어
+   (15분 → 13GB) VAD 로 잘라야 한다. 잘린 구간을 그대로 쓰면 한국어 띄어쓰기가 깨지니 원본에서
+   앞뒤 0.8초 여유를 두고 다시 자른다. sherpa VAD 프레임은 512 샘플 고정이고 시간 단위는 **초**다.
+   구현은 `bench/run_bench.py` 의 `_vad_split`.
+3. **화자 분리는 ERes2Net + 임계값 1.1** — 임계값은 임베딩 모델마다 다르다. CAM++ 는 0.8 이 맞았지만
    ERes2Net 에 0.8 을 쓰면 2인 대화가 3~5명이 된다. 모델을 바꾸면 임계값도 실제 대화로 다시 재야 한다
    (2026-10-07: 사람 수를 2로 정한 한국어 2인 대화에서 ERes2Net 81.5%, CAM++ 75.3%, WeSpeaker 61.7%).
-6. **모델 URL 의 `speaker-recongition-models` 오타는 업스트림 그대로**다. 고치면 404.
-7. **argostranslate 는 가볍게 설치할 수 없다** — `argostranslate.translate` 가 최상위에서
+4. **모델 URL 의 `speaker-recongition-models` 오타는 업스트림 그대로**다. 고치면 404.
+5. **argostranslate 는 가볍게 설치할 수 없다** — `argostranslate.translate` 가 최상위에서
    `stanza` 를 import 하고, stanza 가 PyTorch·CUDA 를 끌어온다. `--no-deps` 우회는 실패한다.
-8. **libsndfile 은 m4a/webm 을 못 읽는다** — 브라우저 녹음이 바로 그 형식이다. PyAV 가 먼저다.
-9. **pydub 은 쓰지 않는다** — `ffprobe` 실행파일까지 요구한다.
-10. **`.mcp.json` 에 중첩 변수 확장을 쓰지 않는다** — `${VAR:-${OTHER}/경로}` 는 확장되지
+6. **libsndfile 은 m4a/webm 을 못 읽는다** — 브라우저 녹음이 바로 그 형식이다. PyAV 가 먼저다.
+7. **pydub 은 쓰지 않는다** — `ffprobe` 실행파일까지 요구한다.
+8. **`.mcp.json` 에 중첩 변수 확장을 쓰지 않는다** — `${VAR:-${OTHER}/경로}` 는 확장되지
     않고 문자 그대로 남아 서버가 ENOENT 로 죽는다. 대신 `scripts/mcp_launcher.py` 를
     거치게 한다. `tests/test_mcp_launcher.py` 가 이 회귀를 막는다.
 
 ### 브라우저판 (아이폰에서 '로딩하다가 새로고침' 되던 문제, 2026-10-07)
 
-11. **웹킷(아이폰의 모든 브라우저·맥 사파리)에는 onnxruntime 일반 판을 쓴다.**
+9. **웹킷(아이폰의 모든 브라우저·맥 사파리)에는 onnxruntime 일반 판을 쓴다.**
     라이브러리는 `navigator.vendor` 로 사파리를 가려내는데, vendor 는 작업자 안에 없다.
     그래서 작업자에서는 asyncify 판을 고르고, 이 판이 iOS 26.2 이후 웹킷 JIT 메모리
     폭주(onnxruntime#26827)를 일으켜 사파리가 탭을 끄고 다시 연다. `useWebKitSafeBuild`
     를 지우지 말 것. 일반 판에는 그래픽 가속이 없어 웹킷은 CPU 로 돈다.
-12. **q8 디코더에는 `graphOptimizationLevel: "basic"` 이 필요하다**(onnxruntime-web 1.26).
+10. **q8 디코더에는 `graphOptimizationLevel: "basic"` 이 필요하다**(onnxruntime-web 1.26).
     없으면 "TransposeDQWeightsForMatMulNBits Missing required scale" 로 세션을 못 만든다.
     인코더는 q4 로 둔다. q8 인코더는 tiny 에서 "베베베…" 만 낸다. CPU 에서 디코더를 q4 로
     돌리면 세 배 느리고 메모리도 더 쓴다.
-13. **transformers.js 는 세션 생성·실행을 하나의 Promise 줄로 묶는다.** 한 번 실패하면 그
+11. **transformers.js 는 세션 생성·실행을 하나의 Promise 줄로 묶는다.** 한 번 실패하면 그
     작업자에서는 이후 호출이 모두 같은 오류로 끝난다. 다시 하려면 새 작업자를 띄운다
     (그래픽 가속이 끊기면 `resume` 으로 이어서 하는 이유).
-14. **아이폰 탭 메모리 한도는 약 1.5GB** — 크롬 실측 '큼' +4GB, '보통' +1.1GB. 아이폰에는
+12. **아이폰 탭 메모리 한도는 약 1.5GB** — 크롬 실측 '큼' +4GB, '보통' +1.1GB. 아이폰에는
     '큼' 을 내놓지 않는다. 사파리는 COEP `credentialless` 를 몰라 격리가 안 된다(CPU 1개).
-15. **웹 화자 구분은 언어별로 모델이 둘이다** — 한국어는 `speaker-model/eres2net-base/`(저장소에 직접 넣음),
+13. **웹 화자 구분은 언어별로 모델이 둘이다** — 한국어는 `speaker-model/eres2net-base/`(저장소에 직접 넣음),
     그 밖은 Hugging Face 의 WeSpeaker. ERes2Net 은 영어 회의에서 더 나빠서 나눴다.
     - 같은 사이트의 모델은 transformers.js 에 **경로**(`/voice-record/speaker-model/...`)로 준다. 전체 URL 을
       주면 "invalid model ID" 로 거부된다. 받는 동안만 `env.allowLocalModels` 를 켜고 꼭 되돌린다.
@@ -102,7 +99,7 @@ cd voicescribe && .venv/bin/python -m ruff check src tests
     - 인원 '자동' 이면 말한 시간 10% 미만 무리를 가장 닮은 사람에게 합친다(`mergeQuietSpeakers`).
       영어는 목소리 모델이 원래 약해서(정답 구간으로도 2인 73%) 기준값만으로는 못 고쳤다.
       인원을 정했으면 합치지 않는다. 측정 스크립트: `~/.cache/voicescribe-bench/web-spk*/`
-16. **transformers.js 에 `language: null` 을 넘기면 언어를 알아내지 않고 영어로 정한다**(경고 한 줄뿐).
+14. **transformers.js 에 `language: null` 을 넘기면 언어를 알아내지 않고 영어로 정한다**(경고 한 줄뿐).
     '자동 감지' 로 한국어 통화가 영어 번역으로 나오고 같은 문장을 되풀이했다(2026-10-09).
     `detectLanguage` 로 직접 고른 뒤 넘긴다. 시험은 사용자 실제 파일(`D:\calls`)로도 돌려 볼 것 —
     공개 평가셋만으로는 이 문제가 안 보였다.

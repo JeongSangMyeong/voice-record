@@ -24,44 +24,20 @@
 | 브라우저 UI | 드래그&드롭 업로드, 마이크로 바로 녹음 |
 | Claude Code 연동 | 대화 중에 "이 녹음 받아써 줘" 로 사용 |
 
-## 엔진 고르기 — 한국어라면 SenseVoice 를 먼저 보세요
+## 받아쓰기 엔진
 
-두 개의 무료 엔진을 제공합니다.
-
-| | **sensevoice** (빠른 모드) | **faster-whisper** (범용) |
-| --- | --- | --- |
-| 지원 언어 | 한·일·중·영·광둥어 **5개** | **100개** |
-| 속도 (4코어 CPU) | **실시간 대비 x16~19** (실측) | 모델 크기에 따라 x1~5 |
-| 설치 용량 | 약 45MB (PyTorch 불필요) | 약 100MB |
-| 모델 크기 | 240MB / 940MB | 75MB ~ 3GB |
-| 모델 받는 곳 | GitHub 릴리스 | Hugging Face |
-| 단어별 타임스탬프 | ✗ | ✓ |
-| Whisper 내장 영어 번역 | ✗ | ✓ |
-| 모델 라이선스 | FunASR (상업적 이용 시 출처 표기) | MIT |
-
-**한국어 회의록이 목적이라면 `sensevoice` 를 먼저 써 보세요.** 속도 차이가 매우 큽니다.
-1시간 녹음이 SenseVoice 로는 3~4분이면 끝납니다.
-
-> 속도 수치의 출처: SenseVoice 는 이 저장소에서 4코어 CPU·GPU 없음 환경에서 직접 측정했습니다.
-> faster-whisper 는 이 환경에서 Hugging Face 접근이 막혀 있어 직접 측정하지 못했고,
-> 위 값은 일반적으로 알려진 범위입니다. 두 엔진 모두 설치해서 짧은 파일로 비교해 보시길 권합니다.
+무료 Whisper(faster-whisper) 하나를 씁니다. 화면의 기본 모델은 `large-v3-turbo` 입니다.
+이 저장소의 벤치마크(`bench/`)에서 실제 회의 녹음을 가장 정확하게 받아쓴 모델입니다.
+그래픽카드 없이 CPU 로 돌리면 개발 노트북에서 실시간의 약 2.4배 속도였습니다(8분 녹음을
+약 3분 20초에, 1시간이면 약 25분). 내용만 급히 볼 때는 `small` 이나 `base` 를 고르세요.
 
 ```bash
-pip install -e ".[fast]"            # SenseVoice 설치
-voicescribe 회의.m4a --engine fast  # 사용
+pip install -e ".[stt]"                        # Whisper 설치
+voicescribe 회의.m4a -l ko -m large-v3-turbo   # 사용
 ```
 
-실측 예시 (모델에 포함된 공식 샘플 음성):
-
-```
-[한국어] 4.6초 → 조금만 생각을 하면서 살면 훨씬 편할 거야.       (자동 감지: ko)
-[영어]   7.2초 → The tribal chieftain called for the boy…      (자동 감지: en)
-[일본어] 7.2초 → うちの中学は弁当制で持っていきない場合は…        (자동 감지: ja)
-[중국어] 5.6초 → 开饭时间早上9点至下午5点。                      (자동 감지: zh)
-```
-
-> 100개 언어가 필요하거나 단어 단위 타임스탬프가 필요하면 `faster-whisper` 를 쓰세요.
-> 엔진을 지정하지 않으면(`--engine auto`) 설치된 것 중 자동으로 고릅니다.
+> SenseVoice(한·일·중·영 고속 엔진)는 2026-10-20 에 뺐습니다. 짧은 문장에서는 빠르고 정확해
+> 보였지만, 실제 회의 녹음에서 단어 경계가 무너지고("해외 영업업을") 화자 구분이 되지 않았습니다.
 
 ## 다른 사람에게 주고 싶다면
 
@@ -143,10 +119,10 @@ pip install -e ".[all]"
 가볍게 시작하고 싶다면 필요한 것만 고르세요.
 
 ```bash
-pip install -e ".[fast]"       # 한국어 고속 엔진 (가장 가벼움, 45MB)
-pip install -e ".[stt]"        # 100개 언어 Whisper 엔진
-pip install -e ".[fast,web]"   # + 브라우저 UI
-pip install -e ".[fast,mcp]"   # + Claude Code 연동
+pip install -e ".[stt]"            # Whisper 받아쓰기 엔진 (100개 언어)
+pip install -e ".[stt,fast]"       # + 화자 구분 (sherpa-onnx, 45MB)
+pip install -e ".[stt,fast,web]"   # + 브라우저 UI
+pip install -e ".[stt,fast,mcp]"   # + Claude Code 연동
 ```
 
 설치가 잘 됐는지 확인합니다.
@@ -251,17 +227,10 @@ GPU 없이 CPU 만으로 돌릴 때의 기준입니다.
 | 모델 | 크기 | 속도 | 추천 |
 | --- | --- | --- | --- |
 | `tiny` | 75MB | 매우 빠름 | 내용만 급히 확인 |
-| `base` | 145MB | 빠름 | 기본값 |
+| `base` | 145MB | 빠름 | 명령줄 기본값 |
 | `small` | 480MB | 보통 | 무난한 품질 |
-| `large-v3-turbo` | 1.6GB | 느림 | Whisper 중에서는 한국어에 가장 나음 |
+| `large-v3-turbo` | 1.6GB | 느림 | 한국어에 가장 나음, PC 화면 기본값 |
 | `large-v3` | 3GB | 매우 느림 | 최고 정확도 |
-
-SenseVoice 엔진의 모델은 두 가지입니다.
-
-| 모델 | 크기 | 비고 |
-| --- | --- | --- |
-| `sensevoice` | 240MB | int8 양자화, 기본값 |
-| `sensevoice-fp32` | 940MB | CPU 에서는 오히려 더 빠르고 정확할 때가 많음 |
 
 모델은 처음 쓸 때 한 번만 자동으로 내려받아 저장됩니다. 이후에는 인터넷 없이 동작합니다.
 
@@ -292,17 +261,8 @@ voicescribe 회의.m4a -m large-v3-turbo --download-root /path/to/models
 HF_ENDPOINT=https://내부미러 voicescribe 회의.m4a -m large-v3-turbo
 ```
 
-SenseVoice 엔진은 Hugging Face 가 아니라 **GitHub 릴리스**에서 받으므로,
-HF 가 막힌 망에서도 대체로 동작합니다.
-
-```bash
-# 미리 받아 ~/.cache/voicescribe/ 에 풀어 두면 됩니다
-curl -LO https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2
-curl -LO https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx
-```
-
-> ⏱️ 1시간짜리 녹음을 4코어 CPU + `large-v3-turbo` 로 처리하면 30분 이상 걸릴 수 있습니다.
-> 급하면 `small` 로 먼저 확인하세요.
+> ⏱️ 1시간짜리 녹음을 CPU + `large-v3-turbo` 로 처리하면 개발 노트북에서 약 25분 걸립니다
+> (`bench/` 단독 측정, 실시간 대비 x2.4). 급하면 `small` 로 먼저 확인하세요.
 
 ## Claude Code 연동 (MCP)
 
@@ -388,11 +348,6 @@ voicescribe 회의.m4a --diarize --max-speakers 3   # 인원을 알면 알려 �
 **Q. 윈도우에서 되나요?**
 됩니다. `python -m venv .venv` → `.venv\Scripts\activate` → `pip install -e ".[all]"` 순서로 설치하세요.
 
-**Q. SenseVoice 결과에서 띄어쓰기가 어색해요.**
-SenseVoice 는 한국어·일본어·중국어에서 띄어쓰기가 일정하지 않을 때가 있습니다(모델 특성).
-내용 자체는 정확하므로 회의록 용도로는 문제없지만, 띄어쓰기가 중요하면
-`--engine faster-whisper -m large-v3-turbo` 를 쓰세요.
-
 **Q. 인식이 자꾸 틀려요.**
 ① 더 큰 모델(`-m large-v3-turbo`)을 쓰고 ② 언어를 직접 지정하고(`-l ko`)
 ③ `--prompt` 로 고유명사를 알려 주세요. 이 세 가지로 대부분 좋아집니다.
@@ -416,7 +371,6 @@ MIT. 사용하는 모델들의 라이선스는 각각 다음과 같습니다.
 | --- | --- | --- |
 | faster-whisper / Whisper 모델 | MIT | 가능 |
 | sherpa-onnx (코드) | Apache-2.0 | 가능 |
-| SenseVoice 모델 가중치 | FunASR Model License | 가능(**출처 표기 필요**) |
 | M2M100 (기본 번역) | MIT | 가능 |
 | NLLB-200 (선택) | CC-BY-NC | **불가** |
 | pyannote (선택) | MIT (모델은 약관 동의 필요) | 가능 |

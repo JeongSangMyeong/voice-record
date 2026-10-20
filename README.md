@@ -51,7 +51,8 @@
 
 ## 2. PC 프로그램 (정확도가 중요할 때)
 
-한국어 정확도가 가장 좋고 속도도 빠릅니다(실측 실시간 대비 x16~19).
+Whisper large-v3-turbo 로 받아써서 한국어 정확도가 가장 좋습니다. 대신 그래픽카드 없는 PC 에서는
+시간이 좀 걸립니다(개발 노트북 실측: 1시간 녹음에 약 25분).
 받는 사람은 **파이썬조차 설치할 필요가 없습니다.**
 
 ### 다른 사람에게 주기
@@ -79,10 +80,10 @@ cd voicescribe/deploy/pc
 ```bash
 cd voicescribe
 python -m venv .venv && source .venv/bin/activate    # 윈도우: .venv\Scripts\activate
-pip install -e ".[fast,web]"
+pip install -e ".[stt,fast,web]"
 
 voicescribe web                                       # 브라우저 UI
-voicescribe 회의.m4a --engine fast -l ko -o ./결과     # 명령줄
+voicescribe 회의.m4a -l ko -m large-v3-turbo -o ./결과  # 명령줄
 ```
 
 기능: 100개 언어 · 화자 구분 · 자막(SRT/VTT) · 번역 · 마크다운 회의록
@@ -121,13 +122,12 @@ voicescribe/               PC 판 본체
 
 ```bash
 cd voicescribe
-pip install -e ".[fast,web,lan,mcp,dev]"
+pip install -e ".[stt,fast,web,lan,mcp,dev]"
 python -m pytest tests/ -q      # 인터넷·모델 없이 통과합니다
 python -m ruff check src tests
 ```
 
 ## 라이선스
 
-MIT. 사용하는 모델은 각각 라이선스가 다릅니다 —
-Whisper 계열 MIT, SenseVoice 는 FunASR Model License(상업적 이용 시 출처 표기).
-자세한 내용은 [`voicescribe/README.md`](voicescribe/README.md) 에 있습니다.
+MIT. 받아쓰기 모델(Whisper 계열)도 MIT 입니다.
+화자 구분·번역 모델의 라이선스는 [`voicescribe/README.md`](voicescribe/README.md) 에 있습니다.

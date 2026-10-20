@@ -210,7 +210,7 @@ async function loadConfig() {
   for (const [name, desc] of Object.entries(cfg.models)) {
     model.appendChild(new Option(`${name} — ${desc}`, name));
   }
-  model.value = cfg.models["base"] ? "base" : Object.keys(cfg.models)[0];
+  model.value = cfg.models["large-v3-turbo"] ? "large-v3-turbo" : (cfg.models["base"] ? "base" : Object.keys(cfg.models)[0]);
 
   const translate = $("translate");
   for (const code of priority) {

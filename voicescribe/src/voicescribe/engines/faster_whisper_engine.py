@@ -136,9 +136,7 @@ class FasterWhisperEngine(TranscriptionEngine):
             "  2) 디스크 여유 공간\n"
             f"  3) 모델 이름 (사용 가능: {', '.join(MODEL_CATALOG)})\n"
             "  * 사내망이라면 HF_ENDPOINT 환경변수나 --download-root 옵션을 확인하세요."
-            f"{manual}\n"
-            "  * Hugging Face 가 막혀 있다면 --engine fast (SenseVoice) 를 쓰세요.\n"
-            "    이 엔진은 GitHub 릴리스에서 모델을 받습니다."
+            f"{manual}"
         )
 
     # ------------------------------------------------------------------ #

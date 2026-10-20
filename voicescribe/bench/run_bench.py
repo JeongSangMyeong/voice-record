@@ -5,7 +5,7 @@
 모델·데이터·결과는 ~/.cache/voicescribe-bench 에만 둔다. 녹음과 정답 원고는
 저장소에 넣지 않는다(MagicHub 는 재배포 금지, 회의 녹음은 사용자 개인 자료).
 
-긴 오디오는 제품의 sherpa 엔진과 같은 방식(_vad_split, 앞뒤 0.8초 여유, 최대 20초)으로
+긴 오디오는 예전 제품의 SenseVoice 엔진과 같은 방식(_vad_split, 앞뒤 0.8초 여유, 최대 20초)으로
 잘라 모든 sherpa 모델에 똑같은 조각을 넣는다. Whisper 는 지금 제품이 하는 그대로
 파일 전체를 넘긴다(현재 기준선).
 """
@@ -32,6 +32,10 @@ RATE = 16000
 THREADS = 8  # 제품의 faster-whisper 기본값 min(8, 코어 수)과 맞춘다.
 MAX_DIRECT_SECONDS = 20.0
 BATCH = 8
+#: VAD 로 자른 구간 앞뒤 여유(초). 0.8초보다 작으면 한국어 띄어쓰기가 깨진다.
+MARGIN_SECONDS = 0.8
+#: silero VAD 가 요구하는 고정 프레임 크기(16kHz 기준).
+VAD_WINDOW = 512
 
 Transcriber = Callable[[np.ndarray], str]
 
@@ -41,15 +45,60 @@ Transcriber = Callable[[np.ndarray], str]
 # --------------------------------------------------------------------------- #
 
 
+def _vad_split(samples: np.ndarray, vad_file: Path) -> list[np.ndarray]:
+    """무음을 기준으로 자른다. SenseVoice 엔진을 지운 2026-10-20 에 이 파일로 옮겼다.
+
+    통째로 넣으면 어텐션 비용이 제곱으로 늘어 15분 오디오에 13GB 램을 쓴다.
+    """
+    import sherpa_onnx
+
+    config = sherpa_onnx.VadModelConfig()
+    config.silero_vad.model = str(vad_file)
+    config.silero_vad.threshold = 0.5
+    # 주의: sherpa-onnx 는 '초' 단위다(pip silero-vad 패키지는 밀리초).
+    config.silero_vad.min_silence_duration = 0.5
+    config.silero_vad.min_speech_duration = 0.25
+    config.silero_vad.max_speech_duration = MAX_DIRECT_SECONDS
+    config.sample_rate = RATE
+    config.num_threads = 1
+    if not config.validate():
+        raise RuntimeError("VAD 설정이 올바르지 않습니다.")
+
+    detector = sherpa_onnx.VoiceActivityDetector(config, buffer_size_in_seconds=100)
+    margin = int(MARGIN_SECONDS * RATE)
+    chunks: list[np.ndarray] = []
+
+    def drain() -> None:
+        while not detector.empty():
+            front = detector.front
+            start = int(front.start)
+            length = len(front.samples)
+            detector.pop()
+            # VAD 가 잘라 준 조각을 그대로 쓰면 앞부분이 잘려 띄어쓰기가 무너진다. 원본에서 여유를 두고 자른다.
+            low, high = start - margin, start + length + margin
+            chunk = samples[max(0, low) : min(len(samples), high)]
+            pad_before, pad_after = max(0, -low), max(0, high - len(samples))
+            if pad_before or pad_after:
+                chunk = np.concatenate(
+                    [np.zeros(pad_before, dtype=np.float32), chunk, np.zeros(pad_after, dtype=np.float32)]
+                )
+            chunks.append(chunk)
+
+    for index in range(0, len(samples), VAD_WINDOW):
+        frame = samples[index : index + VAD_WINDOW]
+        if len(frame) < VAD_WINDOW:
+            break  # 마지막 자투리는 flush 가 처리한다.
+        detector.accept_waveform(frame)
+        drain()
+    detector.flush()
+    drain()
+    return chunks
+
+
 def _vad_chunks(samples: np.ndarray) -> list[np.ndarray]:
     if len(samples) <= MAX_DIRECT_SECONDS * RATE:
         return [samples]
-    import sherpa_onnx
-
-    from voicescribe.engines.sensevoice_engine import _vad_split
-
-    spans = _vad_split(sherpa_onnx, samples, RATE, ROOT / "models/silero_vad.onnx", TranscribeOptions())
-    return [chunk for _start, _end, chunk in spans]
+    return _vad_split(samples, ROOT / "models/silero_vad.onnx")
 
 
 def _offline(recognizer: object, stream_options: dict[str, str]) -> Transcriber:

@@ -12,7 +12,7 @@ from .base import TranscriptionEngine
 _ENGINES: dict[str, TranscriptionEngine] = {}
 
 #: 사용자가 엔진을 고르지 않았을 때 시도할 순서.
-DEFAULT_PRIORITY = ("faster-whisper", "sensevoice", "openai-whisper", "demo")
+DEFAULT_PRIORITY = ("faster-whisper", "openai-whisper", "demo")
 
 
 class UnknownEngineError(ValueError):
@@ -33,9 +33,6 @@ def get_engine(name: str) -> TranscriptionEngine:
         "fw": "faster-whisper",
         "whisper": "faster-whisper",
         "openai": "openai-whisper",
-        "sherpa": "sensevoice",
-        "sense-voice": "sensevoice",
-        "fast": "sensevoice",
     }
     key = aliases.get(key, key)
     engine = _ENGINES.get(key)
@@ -82,9 +79,7 @@ def _ensure_builtins() -> None:
     from .demo import DemoEngine
     from .faster_whisper_engine import FasterWhisperEngine
     from .openai_whisper_engine import OpenAIWhisperEngine
-    from .sensevoice_engine import SenseVoiceEngine
 
     register_engine(FasterWhisperEngine())
-    register_engine(SenseVoiceEngine())
     register_engine(OpenAIWhisperEngine())
     register_engine(DemoEngine())

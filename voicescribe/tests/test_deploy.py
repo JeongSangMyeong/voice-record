@@ -51,11 +51,25 @@ class TestPcLaunchers:
         assert "pyproject.toml" in text, f"{name} 에 폴더 확인 단계가 없습니다"
         assert "압축" in text, f"{name} 에 압축 관련 안내가 없습니다"
 
-    def test_launchers_install_the_fast_engine(self):
-        """받는 사람이 첫 실행에서 바로 받아쓰기가 되어야 한다."""
-        for name in ("시작-윈도우.bat", "시작-리눅스.sh", "시작-맥.command"):
-            text = (PC_DIR / name).read_text(encoding="utf-8")
-            assert "fast" in text and "web" in text, f"{name} 의 설치 대상 확인 필요"
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "시작-윈도우.bat", "시작-리눅스.sh", "시작-맥.command",
+            "시작-휴대폰도쓰기.bat", "시작-휴대폰도쓰기-맥.command", "시작-휴대폰도쓰기-리눅스.sh",
+        ],
+    )
+    def test_launchers_install_whisper(self, name):
+        """받는 사람이 첫 실행에서 바로 받아쓰기가 되어야 한다.
+
+        SenseVoice 를 뺀 뒤로 받아쓰기 엔진은 Whisper(stt) 하나뿐이다.
+        화자 구분(sherpa-onnx)은 fast 묶음에 남아 있다.
+        """
+        text = (PC_DIR / name).read_text(encoding="utf-8")
+        extras = re.search(r'-e "\.\[([^\]]+)\]"', text)
+        assert extras, f"{name} 에 설치 줄이 없습니다"
+        packages = extras.group(1).split(",")
+        for package in ("stt", "fast", "web"):
+            assert package in packages, f"{name} 이 [{package}] 를 설치하지 않습니다"
 
     def test_handover_guide_exists(self):
         guide = PC_DIR / "넘겨주는방법.md"
@@ -83,24 +97,18 @@ class TestHuggingFaceSpace:
         )
         assert result.returncode == 0, result.stderr
 
-    def test_app_pins_the_correct_sensevoice_build(self):
-        """2025-09-09 빌드는 광둥어 전용이라 한국어가 깨진다.
-
-        주석에는 경고 목적으로 그 이름이 나올 수 있으니, 실제로 쓰이는
-        모델 이름과 다운로드 주소만 검사한다.
-        """
+    def test_app_uses_whisper_only(self):
+        """SenseVoice 는 실제 회의 녹음에서 읽기 어려워 2026-10-20 에 뺐다."""
         text = (HF_DIR / "app.py").read_text(encoding="utf-8")
-        code_lines = [
-            line for line in text.splitlines() if not line.lstrip().startswith("#")
-        ]
-        code = "\n".join(code_lines)
-        assert "2024-07-17" in code
-        assert "2025-09-09" not in code
+        assert "from_sense_voice" not in text, "SenseVoice 모델을 아직 불러옵니다"
+        assert "sense-voice" not in text, "SenseVoice 모델 파일을 아직 받습니다"
+        assert "faster_whisper" in text
 
     def test_requirements_match_the_app_imports(self):
         requirements = (HF_DIR / "requirements.txt").read_text(encoding="utf-8")
-        for package in ("gradio", "sherpa-onnx", "faster-whisper", "av", "numpy"):
+        for package in ("gradio", "faster-whisper", "av", "numpy"):
             assert package in requirements, f"{package} 가 requirements.txt 에 없습니다"
+        assert "sherpa-onnx" not in requirements, "앱이 쓰지 않는 sherpa-onnx 를 설치합니다"
 
 
 class TestPhoneLaunchers:

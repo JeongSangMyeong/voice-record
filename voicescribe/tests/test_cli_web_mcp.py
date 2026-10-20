@@ -101,6 +101,17 @@ class TestWebApi:
         assert set(data["formats"]) >= {"txt", "srt", "vtt", "json", "md", "csv"}
         assert any(e["name"] == "demo" and e["available"] for e in data["engines"])
 
+    def test_config_offers_only_whisper_models(self, client):
+        models = client.get("/api/config").json()["models"]
+        assert "large-v3-turbo" in models
+        assert not any("sensevoice" in name for name in models)
+
+    def test_page_starts_on_the_turbo_model(self, client):
+        """PC 판 기본 모델은 정확도가 가장 좋은 large-v3-turbo 다(2026-10-20 사용자 결정)."""
+        html = client.get("/").text
+        line = next(row for row in html.splitlines() if "model.value =" in row)
+        assert line.split("=", 1)[1].strip().startswith('cfg.models["large-v3-turbo"]')
+
     def test_full_job_lifecycle(self, client, two_speaker_wav):
         with two_speaker_wav.open("rb") as handle:
             response = client.post(

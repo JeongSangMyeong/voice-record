@@ -47,6 +47,36 @@ class TestRegistry:
         if not engine.is_available():
             assert "pip install" in engine.install_hint()
 
+    def test_sensevoice_is_gone(self):
+        """실제 회의 녹음에서 단어 경계가 무너지고 화자 구분이 안 돼 2026-10-20 에 뺐다."""
+        assert "sensevoice" not in {e.name for e in list_engines()}
+        for old_name in ("sensevoice", "fast", "sherpa", "sense-voice"):
+            with pytest.raises(UnknownEngineError):
+                get_engine(old_name)
+
+
+class TestWhisperModelCatalog:
+    """Hugging Face Hub 에서 확인한 저장소 정보와 코드가 일치하는지 검사한다."""
+
+    def test_every_model_has_a_repo(self):
+        from voicescribe.engines.faster_whisper_engine import MODEL_CATALOG, MODEL_REPOS
+
+        assert set(MODEL_CATALOG) == set(MODEL_REPOS)
+
+    def test_repo_ids_look_valid(self):
+        from voicescribe.engines.faster_whisper_engine import MODEL_REPOS
+
+        for name, repo in MODEL_REPOS.items():
+            owner, _, model = repo.partition("/")
+            assert owner and model, f"{name} 의 저장소 형식이 잘못됨: {repo}"
+
+    def test_turbo_points_at_the_ct2_conversion(self):
+        """`large-v3-turbo` 는 CTranslate2 로 변환된 저장소여야 한다(원본 openai/ 저장소가 아님)."""
+        from voicescribe.engines.faster_whisper_engine import MODEL_REPOS
+
+        assert MODEL_REPOS["large-v3-turbo"] == "mobiuslabsgmbh/faster-whisper-large-v3-turbo"
+        assert not MODEL_REPOS["large-v3-turbo"].startswith("openai/")
+
 
 class TestOptions:
     def test_rejects_bad_task(self):

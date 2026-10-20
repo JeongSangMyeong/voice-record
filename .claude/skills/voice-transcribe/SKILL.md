@@ -34,8 +34,8 @@ cd voicescribe && uv pip install --python .venv/bin/python faster-whisper
 ## 2. 엔진과 모델 고르기
 
 **기본은 Whisper `large-v3-turbo` 다. 한국어·영어(가장 많이 쓰는 두 언어)와 둘을 섞어 말하는 회의에 모두 맞다.**
-SenseVoice(`--engine fast`)는 빠르지만 실제 회의 녹음에서 단어를 잘게 쪼개 덧붙여 읽기 어려웠다
-(CLAUDE.md '인식 품질을 판단하는 방법'). 사용자가 속도를 콕 집어 원할 때만 쓴다.
+SenseVoice 는 실제 회의 녹음에서 단어를 잘게 쪼개 덧붙여 읽기 어려워 2026-10-20 에 뺐다
+(CLAUDE.md '인식 품질을 판단하는 방법'). `--engine fast` 는 이제 오류가 난다.
 
 | 상황 | 엔진 | 모델 |
 | --- | --- | --- |

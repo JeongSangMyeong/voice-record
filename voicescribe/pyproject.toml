@@ -29,7 +29,7 @@ dependencies = ["numpy>=1.24"]
 audio = ["av>=12", "soundfile>=0.12"]
 # 실제 음성인식(권장). 100개 언어.
 stt = ["faster-whisper>=1.0", "av>=12", "soundfile>=0.12"]
-# 한·일·중·영·광둥어 고속 엔진 + 화자 분리(PyTorch 불필요, 약 45MB).
+# 화자 분리(sherpa-onnx, PyTorch 불필요, 약 45MB). 받아쓰기 엔진은 stt 다.
 fast = ["sherpa-onnx>=1.10", "av>=12", "soundfile>=0.12"]
 # 예비 엔진(PyTorch 필요, 용량 큼).
 stt-openai = ["openai-whisper>=20231117"]

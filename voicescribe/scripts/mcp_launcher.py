@@ -87,8 +87,8 @@ def main() -> None:
             f"  다음을 먼저 실행하세요:\n"
             f"    cd {PROJECT_ROOT}\n"
             "    python3 -m venv .venv\n"
-            '    .venv/bin/pip install -e ".[fast,mcp]"\n'
-            "  (윈도우: .venv\\Scripts\\activate 후 pip install -e \".[fast,mcp]\")\n"
+            '    .venv/bin/pip install -e ".[stt,fast,mcp]"\n'
+            "  (윈도우: .venv\\Scripts\\activate 후 pip install -e \".[stt,fast,mcp]\")\n"
             "  다른 파이썬을 쓰려면 VOICESCRIBE_PYTHON 환경변수에 경로를 지정하세요."
         )
 

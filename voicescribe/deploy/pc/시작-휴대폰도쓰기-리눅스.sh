@@ -48,7 +48,7 @@ echo "  [1/3] 준비 도구 확인 완료"
 # 2) 처음 한 번만: 설치
 if [[ ! -x ".venv/bin/python" ]]; then
   echo "  [2/3] 처음 실행이라 설치를 합니다. 5분쯤 걸립니다..."
-  if ! "$UV" venv .venv --python 3.11 || ! "$UV" pip install --python .venv/bin/python -e ".[fast,web,lan]"; then
+  if ! "$UV" venv .venv --python 3.11 || ! "$UV" pip install --python .venv/bin/python -e ".[stt,fast,web,lan]"; then
     echo
     echo "  [오류] 설치에 실패했습니다. 인터넷 연결을 확인하고 다시 실행해 주세요."
     read -r -p "  엔터를 누르면 닫힙니다..." _

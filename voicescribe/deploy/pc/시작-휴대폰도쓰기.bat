@@ -58,7 +58,7 @@ if not exist ".venv\Scripts\python.exe" (
   echo   [2/3] 처음 실행이라 설치를 합니다. 5분쯤 걸립니다...
   "%UV%" venv .venv --python 3.11
   if errorlevel 1 goto :install_failed
-  "%UV%" pip install --python .venv\Scripts\python.exe -e ".[fast,web,lan]"
+  "%UV%" pip install --python .venv\Scripts\python.exe -e ".[stt,fast,web,lan]"
   if errorlevel 1 goto :install_failed
   echo   설치 완료
 ) else (

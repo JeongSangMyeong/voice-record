@@ -30,7 +30,7 @@ uv pip install --python .venv/bin/python -e ".[all]"
 
 .venv/bin/python -m voicescribe.cli doctor                        # 설치 진단
 .venv/bin/python -m voicescribe.cli web                           # 브라우저 UI
-.venv/bin/python -m voicescribe.cli 녹음.m4a --engine fast -l ko   # 받아쓰기(한국어 고속)
+.venv/bin/python -m voicescribe.cli 녹음.m4a -l ko -m large-v3-turbo   # 받아쓰기
 ```
 
 ## 개발 시 지켜야 할 것
@@ -48,6 +48,7 @@ uv pip install --python .venv/bin/python -e ".[all]"
 
 글자 단위 오류율만 보면 판단을 그르친다. 실제로 SenseVoice 는 글자 오류율이 더 낮은데도
 (15.0% 대 19.3%) 읽기에는 훨씬 나빴다. 단어를 잘게 쪼개 덧붙이는 말이 폭증하기 때문이다.
+그래서 2026-10-20 에 SenseVoice 를 뺐다.
 **단어 단위로 재고, 빠뜨림·틀림·덧붙임을 나눠 본다.**
 
 자세한 규칙은 `.claude/skills/voicescribe-dev/SKILL.md` 에 있다.
