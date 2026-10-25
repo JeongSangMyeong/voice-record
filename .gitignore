@@ -14,3 +14,5 @@ uv.lock
 /output/
 /결과/
 .hf/
+# 에이전트 메모 (개인 작업 기록)
+.claude/agent-memory/
